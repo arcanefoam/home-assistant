@@ -295,7 +295,7 @@ CONFIG_SCHEMA = {
         SCHEDULE_SCHEMA, validate_rule_paths
     ),
     vol.Optional(CONF_SCH_APPEND, default=list): vol.All(
-        SCHEDULE_SCHEMA, validate_rule_paths
+            SCHEDULE_SCHEMA, validate_rule_paths
     ),
     vol.Optional(
         CONF_SCH_SNIPPETS, default=OrderedDict

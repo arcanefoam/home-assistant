@@ -1,20 +1,29 @@
 """
 This module implements the Room class.
 """
+import asyncio
 import logging
 from collections import namedtuple
 import datetime
-from enum import Enum, auto
+from enum import Enum
 
-from cached_property import cached_property
+from homeassistant.components.climate.const import (
+    SERVICE_SET_TEMPERATURE,
+)
+from homeassistant.components.climate.const import DOMAIN as CLIMATE_DOMAIN
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    ATTR_TEMPERATURE,
+)
 from homeassistant.core import callback
 from homeassistant.helpers.event import (
     async_track_state_change,
 )
-
 from .const import (
     CONF_WEEKDAYS,
+    DEFAULT_AWAY_TEMP,
     OFF_VALUE,
+    TEMP_HYSTERESIS,
 )
 from .schedule import Schedule, Rule
 from .util import RangingSet
@@ -33,6 +42,12 @@ class HeatingMode(Enum):
     AUTO = 'auto'
     MANUAL = 'manual'
     AWAY = 'away'
+
+
+class TempDirection(Enum):
+    NONE = 0
+    HEATING = 1
+    COOLING = 2
 
 
 class Room:
@@ -62,23 +77,24 @@ class Room:
     """
 
     def __init__(self, name, room_data, therms, schedule: Schedule):
+        self.hass = None
         self._name = name
-        self._current_set_point = None
+        self._current_set_point = 20
         self._current_room_temp = 20
+        self._current_temp_direction = TempDirection.HEATING
         self._heating_mode = HeatingMode.AUTO
-
-        _LOGGER.debug("room init %s", room_data)
         self._room_data = room_data
         self._therms = {t.entity_id: t.weight for t in therms}
         self._weight_sum = sum(self._therms.values())
         self._therm_boost = {t.entity_id: 0 for t in therms}
         self._therm_boost_prev = {t.entity_id: 0 for t in therms}
         self._therm_set_point = {t.entity_id: 20 for t in therms}
-
         self._schedule = schedule
-
+        self._markers = None
         self._heating = False
-
+        self._temp_lock = asyncio.Lock()
+        self._away = False
+        self._away_temp = DEFAULT_AWAY_TEMP
         if not self._schedule.rules:   # Create default rules
             # Week days
             self._schedule.rules.append(
@@ -152,11 +168,15 @@ class Room:
     def boost(self):
         return any(self._therm_boost.values())
 
-    def current_room_temp(self):
+    def current_temp(self):
         return f'{self._current_room_temp:.1f}'
+
+    def demand_heat(self):
+        return self._heating
 
     def track_thermostats(self, hass):
         """ Request state tracking for room thermostats """
+        self.hass = hass
         _LOGGER.debug("Room %s track_thermostats", self._name)
         for t_id in self._therms.keys():
             async_track_state_change(
@@ -168,7 +188,7 @@ class Room:
         if new_state is None:
             return
         self._async_update_state(entity_id, new_state)
-        # await self.async_update_ha_state()
+        await self._async_control_thermostats()
 
     @callback
     def _async_update_state(self, entity_id, state):
@@ -177,12 +197,19 @@ class Room:
             # Local temperature
             try:
                 local_temp = state.attributes["local_temperature"]
+                prev_temp = self._current_room_temp
                 if len(self._therms) == 1:
                     self._current_room_temp = local_temp
                 else:
                     self._current_room_temp -= (self._current_room_temp * self._therms[entity_id]) / self._weight_sum
                     self._current_room_temp += (local_temp * self._therms[entity_id]) / self._weight_sum
-                _LOGGER.debug("Current temp: %s", self._current_room_temp)
+                if prev_temp > self._current_room_temp:
+                    self._current_temp_direction = TempDirection.COOLING
+                elif prev_temp <= self._current_room_temp:
+                    self._current_temp_direction = TempDirection.HEATING
+                else:
+                    self._current_temp_direction = TempDirection.NONE
+                _LOGGER.info("%s temp: %s, -> %s", self._name, self._current_room_temp, self._current_temp_direction.name)
             except KeyError:
                 pass
             # Is there a thermostat boost?
@@ -190,7 +217,7 @@ class Room:
                 curr_boost = boost_values[state.attributes["boost"]]
                 self._therm_boost[entity_id] = self._therm_boost_prev[entity_id] ^ curr_boost
                 self._therm_boost_prev[entity_id] = curr_boost
-                _LOGGER.debug("Boost: %s", self._therm_boost)
+                _LOGGER.info("%s boost: %s", self._name, self._therm_boost)
             except KeyError:
                 pass
             # Current set-points
@@ -201,7 +228,7 @@ class Room:
         else:
             _LOGGER.warning("Thermostat with id %s is not linked to room %s.", entity_id, self._name)
 
-    async def async_apply_schedule(self, time) -> {}:
+    async def async_apply_schedule(self, time):
         """Applies the value scheduled for the given time."""
         result = None
         if self._schedule:
@@ -210,16 +237,10 @@ class Room:
             _LOGGER.warning("No suitable value found in schedule. Not changing set-points.")
         else:
             new_scheduled_value, markers = result[:2]
-            # TODO Send commands to valves
-            #if not new_scheduled_value != self._current_set_point:    # Skip when scheduled value hasn't changed
-            #    _LOGGER.debug("Result didn't change, not setting it again.")
-            #    return self._current_set_point
-            self._current_set_point = new_scheduled_value
-            self._heating = self._current_set_point > self._current_room_temp
+            self._current_set_point = new_scheduled_value if new_scheduled_value != OFF_VALUE else 5
+            self._determine_heating()
             self._markers = markers
 
-    #@callback
-    #def get_state(self):
         return {f"{self._name}.current_temp": self._current_room_temp,
                 f"{self._name}.current_setpoint": self._current_set_point,
                 f"{self._name}.heating": self._heating,
@@ -228,19 +249,33 @@ class Room:
                 }
 
     @callback
+    def _determine_heating(self):
+        if self._current_temp_direction == TempDirection.HEATING:
+            self._heating = self._current_set_point > self._current_room_temp
+        elif self._current_temp_direction == TempDirection.COOLING:
+            self._heating = self._current_set_point > (self._current_room_temp + TEMP_HYSTERESIS)
+        else:
+            self._heating = False
+        _LOGGER.info("Room %s demands heat: %s", self._name, self._heating)
+
+    @callback
     def validate_value(self, value):
-        """A wrapper around self.app.actor_type.validate_value() that
-        sanely logs validation errors and returns None in that case."""
-        #
-        # assert self.app.actor_type is not None
-        # try:
-        #     value = self.app.actor_type.validate_value(value)
-        # except ValueError as err:
-        #     _LOGGER.error(
-        #         "Invalid value {} for actor type {}: {}".format(
-        #             repr(value), repr(self.app.actor_type.name), err
-        #         ),
-        #         level="ERROR",
-        #     )
-        #     return None
         return value
+
+    async def _async_control_thermostats(self):
+        async with self._temp_lock:
+            if self._heating_mode == HeatingMode.AUTO:
+                for entity_id, sp in self._therm_set_point.items():
+                    if sp != self._current_set_point:
+                        _LOGGER.debug("Setting %s set-point to %s", entity_id, self._current_set_point)
+                        data = {
+                            ATTR_ENTITY_ID: entity_id,
+                            ATTR_TEMPERATURE: self._current_set_point
+                        }
+                        await self.hass.services.async_call(CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE, data)
+
+    async def change_way_mode(self, away, away_temp):
+        self._away = away
+        self._away_temp = away_temp
+        _LOGGER.debug("Setting away of %s to %s : %d", self._name, self._away, self._away_temp)
+

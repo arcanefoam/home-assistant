@@ -5,6 +5,8 @@ DEFAULT_NAME = "Wiser Home"
 DEFAULT_TOLERANCE = 0.3
 OFF_VALUE = "OFF"
 SCHEDULE_INTERVAL = 1
+TEMP_HYSTERESIS = 0.5
+DEFAULT_AWAY_TEMP = 16
 
 CONF_AT_STARTUP = "reset_at_startup"
 CONF_BOILER = "boiler"
@@ -30,3 +32,7 @@ CONF_WEEKS = "weeks"
 CONF_YEARS = "years"
 CONF_WEIGHT = "weight"
 
+ATTR_AWAY_MODE = "away_mode"
+
+SERVICE_SET_AWAY_TEMP = "set_away_temp"
+SERVICE_SET_AWAY_MODE = "set_away_mode"
