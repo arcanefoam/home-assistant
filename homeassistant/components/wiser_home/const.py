@@ -36,3 +36,5 @@ ATTR_AWAY_MODE = "away_mode"
 
 SERVICE_SET_AWAY_TEMP = "set_away_temp"
 SERVICE_SET_AWAY_MODE = "set_away_mode"
+SERVICE_BOOST_ALL = "boost_all"
+SERVICE_CANCEL_OVERRIDES = "cancel_overrides"

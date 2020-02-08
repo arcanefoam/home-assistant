@@ -16,3 +16,12 @@ set_away_temp:
     temperature:
       description: The new target temperature for the Wiser Home.
       example: 25
+boost_all:
+  description: Boost All will apply a boost of +2°C for 1 hour
+  fields:
+cancel_overrides:
+  description: >
+    Cancel All overrides will put all heating back under 'system control' meaning that if you’ve selected
+    Boost All, or even if you’ve boosted or manually overridden a room setpoint individually, this will cancel the
+    override and put all rooms back to their scheduled setpoints.
+  fields:

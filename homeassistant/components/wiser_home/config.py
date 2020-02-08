@@ -128,7 +128,7 @@ def parse_rooms(cfg: dict) -> dict:
         del room_data[CONF_THERM]
         del room_data[CONF_SCHEDULE]
 
-        room = Room(room_name, room_data, therms, sched)
+        room = Room(room_name, therms, sched)
         rooms.append(room)
 
     return rooms

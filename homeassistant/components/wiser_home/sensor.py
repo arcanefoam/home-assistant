@@ -36,6 +36,8 @@ from .const import (
     SCHEDULE_INTERVAL,
     SERVICE_SET_AWAY_TEMP,
     SERVICE_SET_AWAY_MODE,
+    SERVICE_BOOST_ALL,
+    SERVICE_CANCEL_OVERRIDES,
 )
 from .config import parse_rooms, CONFIG_SCHEMA
 
@@ -66,43 +68,33 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         away_temp = call.data.get(ATTR_TEMPERATURE, DEFAULT_AWAY_TEMP)
         await entity.async_set_away_temp(temperature=away_temp)
 
-    hass.services.async_register(
-        DOMAIN, SERVICE_SET_AWAY_TEMP, handle_away_temp_service, SET_AWAY_TEMPERATURE_SCHEMA)
-
-    async def handle_away_service(call):
+    async def handle_away_mode_service(call):
         """Handle the service."""
         away_mode = call.data.get(ATTR_AWAY_MODE, False)
         await entity.async_set_away_mode(away_mode=away_mode)
 
+    async def handle_away_mode_service(call):
+        """Handle the service."""
+        away_mode = call.data.get(ATTR_AWAY_MODE, False)
+        await entity.async_set_away_mode(away_mode=away_mode)
+
+    async def handle_boost_all_service(call):
+        """Handle the service."""
+        await entity.async_boost_all(call)
+
+    async def handle_cancel_overrides_service(call):
+        """Handle the service."""
+        await entity.async_cancel_overrides(call)
+
     hass.services.async_register(
-        DOMAIN, SERVICE_SET_AWAY_MODE, handle_away_service, SET_AWAY_MODE_SCHEMA)
+        DOMAIN, SERVICE_SET_AWAY_TEMP, handle_away_temp_service, SET_AWAY_TEMPERATURE_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_AWAY_MODE, handle_away_mode_service, SET_AWAY_MODE_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_BOOST_ALL, handle_boost_all_service, make_entity_service_schema({}))
+    hass.services.async_register(
+        DOMAIN, SERVICE_CANCEL_OVERRIDES, handle_cancel_overrides_service, make_entity_service_schema({}))
     return True
-
-
-async def async_service_temperature_set(
-    entity: "WiserHome", service: ServiceDataType
-) -> None:
-    """Handle set away mode temperature service."""
-    kwargs = {}
-
-    for value, temp in service.data.items():
-        if value == ATTR_TEMPERATURE:
-            kwargs[value] = temp
-
-    await entity.async_set_away_temp(**kwargs)
-
-
-async def async_service_away_mode_set(
-    entity: "WiserHome", service: ServiceDataType
-) -> None:
-    """Handle set away mode temperature service."""
-    kwargs = {}
-
-    for value, temp in service.data.items():
-        if value == ATTR_TEMPERATURE:
-            kwargs[value] = temp
-
-    await entity.async_set_away_mode(**kwargs)
 
 
 class HeatingMode(Enum):
@@ -137,8 +129,9 @@ class WiserHome(RestoreEntity):
         self.rooms = rooms
         self._attributes = {}
         self._room_for_entity = {}
-        self.away_temp = DEFAULT_AWAY_TEMP
-        self.away = False
+        self._away_temp = DEFAULT_AWAY_TEMP
+        self._boost_all = False
+        self._boost_timer_remove = None
 
     @property
     def name(self):
@@ -156,11 +149,6 @@ class WiserHome(RestoreEntity):
         return "mdi:power"
 
     @property
-    def unit_of_measurement(self):
-        """Return the unit this state is expressed in."""
-        return ""
-
-    @property
     def device_state_attributes(self):
         """Return attributes for the sensor."""
         return self._attributes
@@ -174,16 +162,26 @@ class WiserHome(RestoreEntity):
         await super().async_added_to_hass()
         # Add listener for each thermostat
         for room in self.rooms:
-            room.track_thermostats(self.hass)
+            room.track_valves(self.hass)
         # Add a time internal to evaluate schedules
         self._attributes['boiler'] = 'Off'
-        self._attributes['away_temp'] = self.away_temp
-        self._attributes['away'] = 'On' if self.away else 'Off'
-        async_track_time_interval(self.hass, self._async_control_heating, datetime.timedelta(minutes=SCHEDULE_INTERVAL))
+        self._attributes['away_temp'] = self._away_temp
+        self._attributes['boost'] = self._boost_all
+        async_track_time_interval(self.hass, self._async_control_heater, datetime.timedelta(minutes=SCHEDULE_INTERVAL))
 
-    async def _async_control_heating(self, time, away=False):
-        self._attributes['rooms'] = [await room.async_apply_schedule(time) for room in self.rooms]
-        if any(room.demand_heat() for room in self.rooms):
+    async def _async_control_heater(self, time, away=False):
+        """
+        Timer method called every SCHEDULE_INTERVAL.
+        Requests all rooms to evaluate their schedule.
+        :param time:
+        :param away:
+        :return:
+        """
+        for room in self.rooms:
+            await room.async_tick(time)
+
+        self._attributes['rooms'] = [await room.attributes() for room in self.rooms]
+        if any(room.demands_heat() for room in self.rooms):
             _LOGGER.debug("At least one room needs heat, setting boiler on")
             await self._async_heater_turn_on()
         else:
@@ -202,29 +200,64 @@ class WiserHome(RestoreEntity):
         self._attributes['boiler'] = 'Off'
         await self.hass.services.async_call(HA_DOMAIN, SERVICE_TURN_OFF, data)
 
+
+
+
+
+
+
+
+
+
+
     async def async_set_away_temp(self, **kwargs) -> None:
         """Set new target temperature."""
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
-        self.away_temp = temperature
+        self._away_temp = temperature
         _LOGGER.debug("Wiser Home away temp set to %s", temperature)
-        self._attributes['away_temp'] = self.away_temp
-        if self.away:
-            await self._async_control_heating(time=datetime.datetime.now(), away=True)
+        self._attributes['away_temp'] = self._away_temp
+        if self._away:
+            await self._async_control_heater(time=datetime.datetime.now(), away=True)
 
     async def async_set_away_mode(self, **kwargs):
         """Set away mode."""
         away = kwargs.get(ATTR_AWAY_MODE)
         if away is None:
             return
-        self.away = away
-        if self.away:
+        if away:
             self._mode = HeatingMode.AWAY
         else:
             self._mode = HeatingMode.AUTO
         for room in self.rooms:
-            await room.change_way_mode(away, self.away_temp)
+            await room.async_away_mode(away, self._away_temp)
+
+    async def async_boost_all(self, **kwargs):
+        """
+        Register a timer for one hour and tell all rooms to boost
+        """
+        self._boost_all = True
+        self._boost_timer_remove = async_track_time_interval(
+            self.hass,
+            self._async_boost_end,
+            datetime.timedelta(hours=1))
+        for room in self.rooms:
+            await room.async_boost_all_mode(True)
+
+    async def _async_boost_end(self, **kwargs):
+        """
+        Method called when the boost is over
+        """
+        if self._boost_timer_remove is not None:
+            self._boost_timer_remove()
+        for room in self.rooms:
+            await room.async_boost_all_mode(False)
+
+    async def async_cancel_overrides(self, **kwargs):
+        self._boost_all = False
+        for room in self.rooms:
+            await room.async_auto_mode()
 
 
 
