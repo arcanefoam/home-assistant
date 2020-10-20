@@ -1,52 +1,28 @@
 """Start Home Assistant."""
 import argparse
-import asyncio
 import os
 import platform
 import subprocess
 import sys
 import threading
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import List
 
 from homeassistant.const import REQUIRED_PYTHON_VER, RESTART_EXIT_CODE, __version__
-
-if TYPE_CHECKING:
-    from homeassistant import core
-
-
-def set_loop() -> None:
-    """Attempt to use different loop."""
-    from asyncio.events import BaseDefaultEventLoopPolicy
-
-    if sys.platform == "win32":
-        if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
-            # pylint: disable=no-member
-            policy = asyncio.WindowsProactorEventLoopPolicy()
-        else:
-
-            class ProactorPolicy(BaseDefaultEventLoopPolicy):
-                """Event loop policy to create proactor loops."""
-
-                _loop_factory = asyncio.ProactorEventLoop
-
-            policy = ProactorPolicy()
-
-        asyncio.set_event_loop_policy(policy)
 
 
 def validate_python() -> None:
     """Validate that the right Python version is running."""
     if sys.version_info[:3] < REQUIRED_PYTHON_VER:
         print(
-            "Home Assistant requires at least Python {}.{}.{}".format(
-                *REQUIRED_PYTHON_VER
-            )
+            "Home Assistant requires at least Python "
+            f"{REQUIRED_PYTHON_VER[0]}.{REQUIRED_PYTHON_VER[1]}.{REQUIRED_PYTHON_VER[2]}"
         )
         sys.exit(1)
 
 
 def ensure_config_path(config_dir: str) -> None:
     """Validate the configuration directory."""
+    # pylint: disable=import-outside-toplevel
     import homeassistant.config as config_util
 
     lib_dir = os.path.join(config_dir, "deps")
@@ -78,21 +54,9 @@ def ensure_config_path(config_dir: str) -> None:
             sys.exit(1)
 
 
-async def ensure_config_file(hass: "core.HomeAssistant", config_dir: str) -> str:
-    """Ensure configuration file exists."""
-    import homeassistant.config as config_util
-
-    config_path = await config_util.async_ensure_config_exists(hass, config_dir)
-
-    if config_path is None:
-        print("Error getting configuration path")
-        sys.exit(1)
-
-    return config_path
-
-
 def get_arguments() -> argparse.Namespace:
     """Get parsed passed in arguments."""
+    # pylint: disable=import-outside-toplevel
     import homeassistant.config as config_util
 
     parser = argparse.ArgumentParser(
@@ -107,7 +71,7 @@ def get_arguments() -> argparse.Namespace:
         help="Directory that contains the Home Assistant configuration",
     )
     parser.add_argument(
-        "--demo-mode", action="store_true", help="Start Home Assistant in demo mode"
+        "--safe-mode", action="store_true", help="Start Home Assistant in safe mode"
     )
     parser.add_argument(
         "--debug", action="store_true", help="Start Home Assistant in debug mode"
@@ -180,7 +144,7 @@ def daemonize() -> None:
         sys.exit(0)
 
     # redirect standard file descriptors to devnull
-    infd = open(os.devnull, "r")
+    infd = open(os.devnull)
     outfd = open(os.devnull, "a+")
     sys.stdout.flush()
     sys.stderr.flush()
@@ -193,7 +157,7 @@ def check_pid(pid_file: str) -> None:
     """Check that Home Assistant is not already running."""
     # Check pid file
     try:
-        with open(pid_file, "r") as file:
+        with open(pid_file) as file:
             pid = int(file.readline())
     except OSError:
         # PID File does not exist
@@ -230,6 +194,7 @@ def closefds_osx(min_fd: int, max_fd: int) -> None:
     are guarded. But we can set the close-on-exec flag on everything we want to
     get rid of.
     """
+    # pylint: disable=import-outside-toplevel
     from fcntl import fcntl, F_GETFD, F_SETFD, FD_CLOEXEC
 
     for _fd in range(min_fd, max_fd):
@@ -249,45 +214,6 @@ def cmdline() -> List[str]:
         return [sys.executable] + [arg for arg in sys.argv if arg != "--daemon"]
 
     return [arg for arg in sys.argv if arg != "--daemon"]
-
-
-async def setup_and_run_hass(config_dir: str, args: argparse.Namespace) -> int:
-    """Set up Home Assistant and run."""
-    from homeassistant import bootstrap, core
-
-    hass = core.HomeAssistant()
-
-    if args.demo_mode:
-        config: Dict[str, Any] = {"frontend": {}, "demo": {}}
-        bootstrap.async_from_config_dict(
-            config,
-            hass,
-            config_dir=config_dir,
-            verbose=args.verbose,
-            skip_pip=args.skip_pip,
-            log_rotate_days=args.log_rotate_days,
-            log_file=args.log_file,
-            log_no_color=args.log_no_color,
-        )
-    else:
-        config_file = await ensure_config_file(hass, config_dir)
-        print("Config directory:", config_dir)
-        await bootstrap.async_from_config_file(
-            config_file,
-            hass,
-            verbose=args.verbose,
-            skip_pip=args.skip_pip,
-            log_rotate_days=args.log_rotate_days,
-            log_file=args.log_file,
-            log_no_color=args.log_no_color,
-        )
-
-    if args.open_ui and hass.config.api is not None:
-        import webbrowser
-
-        hass.add_job(webbrowser.open, hass.config.api.base_url)
-
-    return await hass.async_run()
 
 
 def try_to_restart() -> None:
@@ -336,8 +262,6 @@ def main() -> int:
     """Start Home Assistant."""
     validate_python()
 
-    set_loop()
-
     # Run a simple daemon runner process on Windows to handle restarts
     if os.name == "nt" and "--runner" not in sys.argv:
         nt_args = cmdline() + ["--runner"]
@@ -354,11 +278,12 @@ def main() -> int:
     args = get_arguments()
 
     if args.script is not None:
+        # pylint: disable=import-outside-toplevel
         from homeassistant import scripts
 
         return scripts.run(args.script)
 
-    config_dir = os.path.join(os.getcwd(), args.config)
+    config_dir = os.path.abspath(os.path.join(os.getcwd(), args.config))
     ensure_config_path(config_dir)
 
     # Daemon functions
@@ -369,7 +294,22 @@ def main() -> int:
     if args.pid_file:
         write_pid(args.pid_file)
 
-    exit_code = asyncio.run(setup_and_run_hass(config_dir, args))
+    # pylint: disable=import-outside-toplevel
+    from homeassistant import runner
+
+    runtime_conf = runner.RuntimeConfig(
+        config_dir=config_dir,
+        verbose=args.verbose,
+        log_rotate_days=args.log_rotate_days,
+        log_file=args.log_file,
+        log_no_color=args.log_no_color,
+        skip_pip=args.skip_pip,
+        safe_mode=args.safe_mode,
+        debug=args.debug,
+        open_ui=args.open_ui,
+    )
+
+    exit_code = runner.run(runtime_conf)
     if exit_code == RESTART_EXIT_CODE and not args.runner:
         try_to_restart()
 

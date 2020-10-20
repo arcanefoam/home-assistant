@@ -202,7 +202,7 @@ def setup(hass: HomeAssistant, base_config):
         if multiprocessing.cpu_count() < 2
         else None
     )
-    host = base_config[DOMAIN].get(CONF_HOST, None)
+    host = base_config[DOMAIN].get(CONF_HOST)
     display_name = base_config[DOMAIN].get(CONF_DISPLAY_NAME, DEFAULT_DISPLAY_NAME)
     if host:
         adapter = TcpAdapter(host, name=display_name, activate_source=False)
@@ -353,7 +353,7 @@ def setup(hass: HomeAssistant, base_config):
     return True
 
 
-class CecDevice(Entity):
+class CecEntity(Entity):
     """Representation of a HDMI CEC device entity."""
 
     def __init__(self, device, logical) -> None:
@@ -387,6 +387,15 @@ class CecDevice(Entity):
     def _update(self, device=None):
         """Device status changed, schedule an update."""
         self.schedule_update_ha_state(True)
+
+    @property
+    def should_poll(self):
+        """
+        Return false.
+
+        CecEntity.update() is called by the HDMI network when there is new data.
+        """
+        return False
 
     @property
     def name(self):

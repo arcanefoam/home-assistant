@@ -26,6 +26,9 @@ async def async_enable_proactive_mode(hass, smart_home_config):
     await smart_home_config.async_get_access_token()
 
     async def async_entity_state_listener(changed_entity, old_state, new_state):
+        if not hass.is_running:
+            return
+
         if not new_state:
             return
 
@@ -98,7 +101,7 @@ async def async_send_changereport_message(
             )
 
     except (asyncio.TimeoutError, aiohttp.ClientError):
-        _LOGGER.error("Timeout sending report to Alexa.")
+        _LOGGER.error("Timeout sending report to Alexa")
         return
 
     response_text = await response.text()
@@ -230,7 +233,7 @@ async def async_send_doorbell_event_message(hass, config, alexa_entity):
             )
 
     except (asyncio.TimeoutError, aiohttp.ClientError):
-        _LOGGER.error("Timeout sending report to Alexa.")
+        _LOGGER.error("Timeout sending report to Alexa")
         return
 
     response_text = await response.text()

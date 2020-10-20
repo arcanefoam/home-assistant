@@ -130,7 +130,7 @@ class SeventeenTrackSummarySensor(Entity):
     @property
     def unique_id(self):
         """Return a unique, Home Assistant friendly identifier for this entity."""
-        return "summary_{0}_{1}".format(self._data.account_id, slugify(self._status))
+        return "summary_{}_{}".format(self._data.account_id, slugify(self._status))
 
     @property
     def unit_of_measurement(self):
@@ -259,7 +259,7 @@ class SeventeenTrackPackageSensor(Entity):
             self._friendly_name if self._friendly_name else self._tracking_number
         )
         message = NOTIFICATION_DELIVERED_MESSAGE.format(
-            self._tracking_number, identification
+            identification, self._tracking_number
         )
         title = NOTIFICATION_DELIVERED_TITLE.format(identification)
         notification_id = NOTIFICATION_DELIVERED_TITLE.format(self._tracking_number)

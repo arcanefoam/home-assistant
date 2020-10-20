@@ -134,7 +134,7 @@ class FibaroController:
             info = self._client.info.get()
             self.hub_serial = slugify(info.serialNumber)
         except AssertionError:
-            _LOGGER.error("Can't connect to Fibaro HC. Please check URL.")
+            _LOGGER.error("Can't connect to Fibaro HC. Please check URL")
             return False
         if login is None or login.status is False:
             _LOGGER.error(
@@ -227,10 +227,7 @@ class FibaroController:
                     device_type = "sensor"
 
         # Switches that control lights should show up as lights
-        if (
-            device_type == "switch"
-            and device.properties.get("isLight", "false") == "true"
-        ):
+        if device_type == "switch" and device.properties.get("isLight", False):
             device_type = "light"
         return device_type
 
@@ -238,21 +235,22 @@ class FibaroController:
         scenes = self._client.scenes.list()
         self._scene_map = {}
         for device in scenes:
-            if not device.visible:
+            if "name" not in device or "id" not in device:
                 continue
             device.fibaro_controller = self
-            if device.roomID == 0:
+            if "roomID" not in device or device.roomID == 0:
                 room_name = "Unknown"
             else:
                 room_name = self._room_map[device.roomID].name
             device.room_name = room_name
             device.friendly_name = f"{room_name} {device.name}"
-            device.ha_id = "scene_{}_{}_{}".format(
-                slugify(room_name), slugify(device.name), device.id
+            device.ha_id = (
+                f"scene_{slugify(room_name)}_{slugify(device.name)}_{device.id}"
             )
             device.unique_id_str = f"{self.hub_serial}.scene.{device.id}"
             self._scene_map[device.id] = device
             self.fibaro_devices["scene"].append(device)
+            _LOGGER.debug("%s scene -> %s", device.ha_id, device)
 
     def _read_devices(self):
         """Read and process the device list."""
@@ -262,15 +260,17 @@ class FibaroController:
         last_climate_parent = None
         for device in devices:
             try:
+                if "name" not in device or "id" not in device:
+                    continue
                 device.fibaro_controller = self
-                if device.roomID == 0:
+                if "roomID" not in device or device.roomID == 0:
                     room_name = "Unknown"
                 else:
                     room_name = self._room_map[device.roomID].name
                 device.room_name = room_name
                 device.friendly_name = f"{room_name} {device.name}"
-                device.ha_id = "{}_{}_{}".format(
-                    slugify(room_name), slugify(device.name), device.id
+                device.ha_id = (
+                    f"{slugify(room_name)}_{slugify(device.name)}_{device.id}"
                 )
                 if (
                     device.enabled
@@ -295,7 +295,11 @@ class FibaroController:
                         # otherwise add the first visible device in the group
                         # which is a hack, but solves a problem with FGT having
                         # hidden compatibility devices before the real device
-                        if last_climate_parent != device.parentId and device.visible:
+                        if (
+                            last_climate_parent != device.parentId
+                            and "visible" in device
+                            and device.visible
+                        ):
                             self.fibaro_devices[dtype].append(device)
                             last_climate_parent = device.parentId
                 _LOGGER.debug(
@@ -426,11 +430,6 @@ class FibaroDevice(Entity):
             self.dont_know_message(cmd)
 
     @property
-    def hidden(self) -> bool:
-        """Return True if the entity should be hidden from UIs."""
-        return self.fibaro_device.visible is False
-
-    @property
     def current_power_w(self):
         """Return the current power usage in W."""
         if "power" in self.fibaro_device.properties:
@@ -466,10 +465,6 @@ class FibaroDevice(Entity):
     def should_poll(self):
         """Get polling requirement from fibaro device."""
         return False
-
-    def update(self):
-        """Call to update state."""
-        pass
 
     @property
     def device_state_attributes(self):

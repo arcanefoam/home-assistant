@@ -36,8 +36,6 @@ SERVICE_RECORD_SCHEMA = STREAM_SERVICE_SCHEMA.extend(
         vol.Optional(CONF_LOOKBACK, default=0): int,
     }
 )
-# Set log level to error for libav
-logging.getLogger("libav").setLevel(logging.ERROR)
 
 
 @bind_hass
@@ -50,13 +48,12 @@ def request_stream(hass, stream_source, *, fmt="hls", keepalive=False, options=N
         options = {}
 
     # For RTSP streams, prefer TCP
-    if (
-        isinstance(stream_source, str)
-        and stream_source[:7] == "rtsp://"
-        and not options
-    ):
-        options["rtsp_flags"] = "prefer_tcp"
-        options["stimeout"] = "5000000"
+    if isinstance(stream_source, str) and stream_source[:7] == "rtsp://":
+        options = {
+            "rtsp_flags": "prefer_tcp",
+            "stimeout": "5000000",
+            **options,
+        }
 
     try:
         streams = hass.data[DOMAIN][ATTR_STREAMS]
@@ -81,6 +78,9 @@ def request_stream(hass, stream_source, *, fmt="hls", keepalive=False, options=N
 
 async def async_setup(hass, config):
     """Set up stream."""
+    # Set log level to error for libav
+    logging.getLogger("libav").setLevel(logging.ERROR)
+
     # Keep import here so that we can import stream integration without installing reqs
     # pylint: disable=import-outside-toplevel
     from .recorder import async_setup_recorder
@@ -102,7 +102,7 @@ async def async_setup(hass, config):
         for stream in hass.data[DOMAIN][ATTR_STREAMS].values():
             stream.keepalive = False
             stream.stop()
-        _LOGGER.info("Stopped stream workers.")
+        _LOGGER.info("Stopped stream workers")
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, shutdown)
 

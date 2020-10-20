@@ -24,7 +24,7 @@ from homeassistant.const import (
 from homeassistant.core import callback
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import async_track_state_change
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util.decorator import Registry
 import homeassistant.util.dt as dt_util
 
@@ -173,46 +173,51 @@ class SensorFilter(Entity):
         self._filters = filters
         self._icon = None
 
+    @callback
+    def _update_filter_sensor_state_event(self, event):
+        """Handle device state changes."""
+        self._update_filter_sensor_state(event.data.get("new_state"))
+
+    @callback
+    def _update_filter_sensor_state(self, new_state, update_ha=True):
+        """Process device state changes."""
+        if new_state is None or new_state.state in [STATE_UNKNOWN, STATE_UNAVAILABLE]:
+            return
+
+        temp_state = new_state
+
+        try:
+            for filt in self._filters:
+                filtered_state = filt.filter_state(copy(temp_state))
+                _LOGGER.debug(
+                    "%s(%s=%s) -> %s",
+                    filt.name,
+                    self._entity,
+                    temp_state.state,
+                    "skip" if filt.skip_processing else filtered_state.state,
+                )
+                if filt.skip_processing:
+                    return
+                temp_state = filtered_state
+        except ValueError:
+            _LOGGER.error("Could not convert state: %s to number", self._state)
+            return
+
+        self._state = temp_state.state
+
+        if self._icon is None:
+            self._icon = new_state.attributes.get(ATTR_ICON, ICON)
+
+        if self._unit_of_measurement is None:
+            self._unit_of_measurement = new_state.attributes.get(
+                ATTR_UNIT_OF_MEASUREMENT
+            )
+
+        if update_ha:
+            self.async_write_ha_state()
+
     async def async_added_to_hass(self):
         """Register callbacks."""
-
-        @callback
-        def filter_sensor_state_listener(entity, old_state, new_state, update_ha=True):
-            """Handle device state changes."""
-            if new_state.state in [STATE_UNKNOWN, STATE_UNAVAILABLE]:
-                return
-
-            temp_state = new_state
-
-            try:
-                for filt in self._filters:
-                    filtered_state = filt.filter_state(copy(temp_state))
-                    _LOGGER.debug(
-                        "%s(%s=%s) -> %s",
-                        filt.name,
-                        self._entity,
-                        temp_state.state,
-                        "skip" if filt.skip_processing else filtered_state.state,
-                    )
-                    if filt.skip_processing:
-                        return
-                    temp_state = filtered_state
-            except ValueError:
-                _LOGGER.error("Could not convert state: %s to number", self._state)
-                return
-
-            self._state = temp_state.state
-
-            if self._icon is None:
-                self._icon = new_state.attributes.get(ATTR_ICON, ICON)
-
-            if self._unit_of_measurement is None:
-                self._unit_of_measurement = new_state.attributes.get(
-                    ATTR_UNIT_OF_MEASUREMENT
-                )
-
-            if update_ha:
-                self.async_schedule_update_ha_state()
 
         if "recorder" in self.hass.config.components:
             history_list = []
@@ -271,12 +276,12 @@ class SensorFilter(Entity):
             )
 
             # Replay history through the filter chain
-            prev_state = None
             for state in history_list:
-                filter_sensor_state_listener(self._entity, prev_state, state, False)
-                prev_state = state
+                self._update_filter_sensor_state(state, False)
 
-        async_track_state_change(self.hass, self._entity, filter_sensor_state_listener)
+        async_track_state_change_event(
+            self.hass, [self._entity], self._update_filter_sensor_state_event
+        )
 
     @property
     def name(self):
@@ -364,6 +369,7 @@ class Filter:
         self._skip_processing = False
         self._window_size = window_size
         self._store_raw = False
+        self._only_numbers = True
 
     @property
     def window_size(self):
@@ -377,7 +383,7 @@ class Filter:
 
     @property
     def skip_processing(self):
-        """Return wether the current filter_state should be skipped."""
+        """Return whether the current filter_state should be skipped."""
         return self._skip_processing
 
     def _filter_state(self, new_state):
@@ -386,7 +392,11 @@ class Filter:
 
     def filter_state(self, new_state):
         """Implement a common interface for filters."""
-        filtered = self._filter_state(FilterState(new_state))
+        fstate = FilterState(new_state)
+        if self._only_numbers and not isinstance(fstate.state, Number):
+            raise ValueError
+
+        filtered = self._filter_state(fstate)
         filtered.set_precision(self.precision)
         if self._store_raw:
             self.states.append(copy(FilterState(new_state)))
@@ -423,6 +433,7 @@ class RangeFilter(Filter):
 
     def _filter_state(self, new_state):
         """Implement the range filter."""
+
         if self._upper_bound is not None and new_state.state > self._upper_bound:
 
             self._stats_internal["erasures_up"] += 1
@@ -469,6 +480,7 @@ class OutlierFilter(Filter):
 
     def _filter_state(self, new_state):
         """Implement the outlier filter."""
+
         median = statistics.median([s.state for s in self.states]) if self.states else 0
         if (
             len(self.states) == self.states.maxlen
@@ -498,6 +510,7 @@ class LowPassFilter(Filter):
 
     def _filter_state(self, new_state):
         """Implement the low pass filter."""
+
         if not self.states:
             return new_state
 
@@ -539,6 +552,7 @@ class TimeSMAFilter(Filter):
 
     def _filter_state(self, new_state):
         """Implement the Simple Moving Average filter."""
+
         self._leak(new_state.timestamp)
         self.queue.append(copy(new_state))
 
@@ -565,6 +579,7 @@ class ThrottleFilter(Filter):
     def __init__(self, window_size, precision, entity):
         """Initialize Filter."""
         super().__init__(FILTER_NAME_THROTTLE, window_size, precision, entity)
+        self._only_numbers = False
 
     def _filter_state(self, new_state):
         """Implement the throttle filter."""
@@ -589,6 +604,7 @@ class TimeThrottleFilter(Filter):
         super().__init__(FILTER_NAME_TIME_THROTTLE, window_size, precision, entity)
         self._time_window = window_size
         self._last_emitted_at = None
+        self._only_numbers = False
 
     def _filter_state(self, new_state):
         """Implement the filter."""

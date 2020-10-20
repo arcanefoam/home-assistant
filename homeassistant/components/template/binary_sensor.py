@@ -7,7 +7,7 @@ from homeassistant.components.binary_sensor import (
     DEVICE_CLASSES_SCHEMA,
     ENTITY_ID_FORMAT,
     PLATFORM_SCHEMA,
-    BinarySensorDevice,
+    BinarySensorEntity,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -16,6 +16,7 @@ from homeassistant.const import (
     CONF_ENTITY_PICTURE_TEMPLATE,
     CONF_ICON_TEMPLATE,
     CONF_SENSORS,
+    CONF_UNIQUE_ID,
     CONF_VALUE_TEMPLATE,
     EVENT_HOMEASSISTANT_START,
     MATCH_ALL,
@@ -24,7 +25,10 @@ from homeassistant.core import callback
 from homeassistant.exceptions import TemplateError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import async_generate_entity_id
-from homeassistant.helpers.event import async_track_same_state, async_track_state_change
+from homeassistant.helpers.event import (
+    async_track_same_state,
+    async_track_state_change_event,
+)
 
 from . import extract_entities, initialise_templates
 from .const import CONF_AVAILABILITY_TEMPLATE
@@ -47,6 +51,7 @@ SENSOR_SCHEMA = vol.Schema(
         vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
         vol.Optional(CONF_DELAY_ON): vol.All(cv.time_period, cv.positive_timedelta),
         vol.Optional(CONF_DELAY_OFF): vol.All(cv.time_period, cv.positive_timedelta),
+        vol.Optional(CONF_UNIQUE_ID): cv.string,
     }
 )
 
@@ -70,6 +75,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         device_class = device_config.get(CONF_DEVICE_CLASS)
         delay_on = device_config.get(CONF_DELAY_ON)
         delay_off = device_config.get(CONF_DELAY_OFF)
+        unique_id = device_config.get(CONF_UNIQUE_ID)
 
         templates = {
             CONF_VALUE_TEMPLATE: value_template,
@@ -101,17 +107,14 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
                 delay_on,
                 delay_off,
                 attribute_templates,
+                unique_id,
             )
         )
-    if not sensors:
-        _LOGGER.error("No sensors added")
-        return False
 
     async_add_entities(sensors)
-    return True
 
 
-class BinarySensorTemplate(BinarySensorDevice):
+class BinarySensorTemplate(BinarySensorEntity):
     """A virtual binary sensor that triggers from another sensor."""
 
     def __init__(
@@ -128,6 +131,7 @@ class BinarySensorTemplate(BinarySensorDevice):
         delay_on,
         delay_off,
         attribute_templates,
+        unique_id,
     ):
         """Initialize the Template binary sensor."""
         self.hass = hass
@@ -147,12 +151,13 @@ class BinarySensorTemplate(BinarySensorDevice):
         self._available = True
         self._attribute_templates = attribute_templates
         self._attributes = {}
+        self._unique_id = unique_id
 
     async def async_added_to_hass(self):
         """Register callbacks."""
 
         @callback
-        def template_bsensor_state_listener(entity, old_state, new_state):
+        def template_bsensor_state_listener(event):
             """Handle the target device state changes."""
             self.async_check_state()
 
@@ -161,7 +166,7 @@ class BinarySensorTemplate(BinarySensorDevice):
             """Update template on startup."""
             if self._entities != MATCH_ALL:
                 # Track state change only for valid templates
-                async_track_state_change(
+                async_track_state_change_event(
                     self.hass, self._entities, template_bsensor_state_listener
                 )
 
@@ -175,6 +180,11 @@ class BinarySensorTemplate(BinarySensorDevice):
     def name(self):
         """Return the name of the sensor."""
         return self._name
+
+    @property
+    def unique_id(self):
+        """Return the unique id of this binary sensor."""
+        return self._unique_id
 
     @property
     def icon(self):
@@ -259,7 +269,7 @@ class BinarySensorTemplate(BinarySensorDevice):
                 ):
                     # Common during HA startup - so just a warning
                     _LOGGER.warning(
-                        "Could not render %s template %s, the state is unknown.",
+                        "Could not render %s template %s, the state is unknown",
                         friendly_property_name,
                         self._name,
                     )
@@ -287,7 +297,7 @@ class BinarySensorTemplate(BinarySensorDevice):
         def set_state():
             """Set state of template binary sensor."""
             self._state = state
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
         # state without delay
         if (state and not self._delay_on) or (not state and not self._delay_off):

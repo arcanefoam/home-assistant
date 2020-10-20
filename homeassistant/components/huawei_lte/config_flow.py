@@ -40,7 +40,7 @@ _LOGGER = logging.getLogger(__name__)
 class ConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle Huawei LTE config flow."""
 
-    VERSION = 1
+    VERSION = 2
     CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
 
     @staticmethod
@@ -206,13 +206,19 @@ class ConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 user_input=user_input, errors=errors
             )
 
-        title = await self.hass.async_add_executor_job(get_router_title, conn)
+        # pylint: disable=no-member
+        title = self.context.get("title_placeholders", {}).get(
+            CONF_NAME
+        ) or await self.hass.async_add_executor_job(get_router_title, conn)
         await self.hass.async_add_executor_job(logout)
 
         return self.async_create_entry(title=title, data=user_input)
 
     async def async_step_ssdp(self, discovery_info):
         """Handle SSDP initiated config flow."""
+        await self.async_set_unique_id(discovery_info[ssdp.ATTR_UPNP_UDN])
+        self._abort_if_unique_id_configured()
+
         # Attempt to distinguish from other non-LTE Huawei router devices, at least
         # some ones we are interested in have "Mobile Wi-Fi" friendlyName.
         if "mobile" not in discovery_info.get(ssdp.ATTR_UPNP_FRIENDLY_NAME, "").lower():
@@ -235,6 +241,10 @@ class ConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if self._already_configured(user_input):
             return self.async_abort(reason="already_configured")
 
+        # pylint: disable=no-member
+        self.context["title_placeholders"] = {
+            CONF_NAME: discovery_info.get(ssdp.ATTR_UPNP_FRIENDLY_NAME)
+        }
         return await self._async_show_user_form(user_input)
 
 
@@ -247,9 +257,16 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input=None):
         """Handle options flow."""
+
+        # Recipients are persisted as a list, but handled as comma separated string in UI
+
         if user_input is not None:
             # Preserve existing options, for example *_from_yaml markers
             data = {**self.config_entry.options, **user_input}
+            if not isinstance(data[CONF_RECIPIENT], list):
+                data[CONF_RECIPIENT] = [
+                    x.strip() for x in data[CONF_RECIPIENT].split(",")
+                ]
             return self.async_create_entry(title="", data=data)
 
         data_schema = vol.Schema(
@@ -262,7 +279,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 ): str,
                 vol.Optional(
                     CONF_RECIPIENT,
-                    default=self.config_entry.options.get(CONF_RECIPIENT, ""),
+                    default=", ".join(
+                        self.config_entry.options.get(CONF_RECIPIENT, [])
+                    ),
                 ): str,
             }
         )

@@ -1,16 +1,11 @@
 """Support for Tesla binary sensor."""
 import logging
 
-from homeassistant.components.binary_sensor import BinarySensorDevice
+from homeassistant.components.binary_sensor import DEVICE_CLASSES, BinarySensorEntity
 
 from . import DOMAIN as TESLA_DOMAIN, TeslaDevice
 
 _LOGGER = logging.getLogger(__name__)
-
-
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up the Tesla binary sensor."""
-    pass
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
@@ -20,7 +15,6 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
             TeslaBinarySensor(
                 device,
                 hass.data[TESLA_DOMAIN][config_entry.entry_id]["controller"],
-                "connectivity",
                 config_entry,
             )
             for device in hass.data[TESLA_DOMAIN][config_entry.entry_id]["devices"][
@@ -31,24 +25,21 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     )
 
 
-class TeslaBinarySensor(TeslaDevice, BinarySensorDevice):
+class TeslaBinarySensor(TeslaDevice, BinarySensorEntity):
     """Implement an Tesla binary sensor for parking and charger."""
 
-    def __init__(self, tesla_device, controller, sensor_type, config_entry):
+    def __init__(self, tesla_device, controller, config_entry):
         """Initialise of a Tesla binary sensor."""
         super().__init__(tesla_device, controller, config_entry)
-        self._state = False
-        self._sensor_type = sensor_type
+        self._state = None
+        self._sensor_type = None
+        if tesla_device.sensor_type in DEVICE_CLASSES:
+            self._sensor_type = tesla_device.sensor_type
 
     @property
     def device_class(self):
         """Return the class of this binary sensor."""
         return self._sensor_type
-
-    @property
-    def name(self):
-        """Return the name of the binary sensor."""
-        return self._name
 
     @property
     def is_on(self):
@@ -60,3 +51,4 @@ class TeslaBinarySensor(TeslaDevice, BinarySensorDevice):
         _LOGGER.debug("Updating sensor: %s", self._name)
         await super().async_update()
         self._state = self.tesla_device.get_value()
+        self._attributes = self.tesla_device.attrs

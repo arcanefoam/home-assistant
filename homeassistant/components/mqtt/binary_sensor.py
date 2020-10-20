@@ -7,7 +7,7 @@ import voluptuous as vol
 from homeassistant.components import binary_sensor, mqtt
 from homeassistant.components.binary_sensor import (
     DEVICE_CLASSES_SCHEMA,
-    BinarySensorDevice,
+    BinarySensorEntity,
 )
 from homeassistant.const import (
     CONF_DEVICE,
@@ -37,6 +37,7 @@ from . import (
     MqttEntityDeviceInfo,
     subscription,
 )
+from .debug_info import log_messages
 from .discovery import MQTT_DISCOVERY_NEW, clear_discovery_hash
 
 _LOGGER = logging.getLogger(__name__)
@@ -79,15 +80,14 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
     async def async_discover(discovery_payload):
         """Discover and add a MQTT binary sensor."""
+        discovery_data = discovery_payload.discovery_data
         try:
-            discovery_hash = discovery_payload.pop(ATTR_DISCOVERY_HASH)
             config = PLATFORM_SCHEMA(discovery_payload)
             await _async_setup_entity(
-                config, async_add_entities, config_entry, discovery_hash
+                config, async_add_entities, config_entry, discovery_data
             )
         except Exception:
-            if discovery_hash:
-                clear_discovery_hash(hass, discovery_hash)
+            clear_discovery_hash(hass, discovery_data[ATTR_DISCOVERY_HASH])
             raise
 
     async_dispatcher_connect(
@@ -96,10 +96,10 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
 
 async def _async_setup_entity(
-    config, async_add_entities, config_entry=None, discovery_hash=None
+    config, async_add_entities, config_entry=None, discovery_data=None
 ):
     """Set up the MQTT binary sensor."""
-    async_add_entities([MqttBinarySensor(config, config_entry, discovery_hash)])
+    async_add_entities([MqttBinarySensor(config, config_entry, discovery_data)])
 
 
 class MqttBinarySensor(
@@ -107,11 +107,11 @@ class MqttBinarySensor(
     MqttAvailability,
     MqttDiscoveryUpdate,
     MqttEntityDeviceInfo,
-    BinarySensorDevice,
+    BinarySensorEntity,
 ):
     """Representation a binary sensor that is updated by MQTT."""
 
-    def __init__(self, config, config_entry, discovery_hash):
+    def __init__(self, config, config_entry, discovery_data):
         """Initialize the MQTT binary sensor."""
         self._config = config
         self._unique_id = config.get(CONF_UNIQUE_ID)
@@ -119,12 +119,16 @@ class MqttBinarySensor(
         self._sub_state = None
         self._expiration_trigger = None
         self._delay_listener = None
-        self._expired = None
+        expire_after = config.get(CONF_EXPIRE_AFTER)
+        if expire_after is not None and expire_after > 0:
+            self._expired = True
+        else:
+            self._expired = None
         device_config = config.get(CONF_DEVICE)
 
         MqttAttributes.__init__(self, config)
         MqttAvailability.__init__(self, config)
-        MqttDiscoveryUpdate.__init__(self, discovery_hash, self.discovery_update)
+        MqttDiscoveryUpdate.__init__(self, discovery_data, self.discovery_update)
         MqttEntityDeviceInfo.__init__(self, device_config, config_entry)
 
     async def async_added_to_hass(self):
@@ -156,6 +160,7 @@ class MqttBinarySensor(
             self.async_write_ha_state()
 
         @callback
+        @log_messages(self.hass, self.entity_id)
         def state_message_received(msg):
             """Handle a new received MQTT state message."""
             payload = msg.payload
@@ -164,7 +169,8 @@ class MqttBinarySensor(
 
             if expire_after is not None and expire_after > 0:
 
-                # When expire_after is set, and we receive a message, assume device is not expired since it has to be to receive the message
+                # When expire_after is set, and we receive a message, assume device is
+                # not expired since it has to be to receive the message
                 self._expired = False
 
                 # Reset old trigger
@@ -176,7 +182,7 @@ class MqttBinarySensor(
                 expiration_at = dt_util.utcnow() + timedelta(seconds=expire_after)
 
                 self._expiration_trigger = async_track_point_in_utc_time(
-                    self.hass, self.value_is_expired, expiration_at
+                    self.hass, self._value_is_expired, expiration_at
                 )
 
             value_template = self._config.get(CONF_VALUE_TEMPLATE)
@@ -184,17 +190,30 @@ class MqttBinarySensor(
                 payload = value_template.async_render_with_possible_json_value(
                     payload, variables={"entity_id": self.entity_id}
                 )
+                if not payload.strip():  # No output from template, ignore
+                    _LOGGER.debug(
+                        "Empty template output for entity: %s with state topic: %s. Payload: '%s', with value template '%s'",
+                        self._config[CONF_NAME],
+                        self._config[CONF_STATE_TOPIC],
+                        msg.payload,
+                        value_template,
+                    )
+                    return
+
             if payload == self._config[CONF_PAYLOAD_ON]:
                 self._state = True
             elif payload == self._config[CONF_PAYLOAD_OFF]:
                 self._state = False
             else:  # Payload is not for this entity
-                _LOGGER.warning(
-                    "No matching payload found for entity: %s with state topic: %s. Payload: %s, with value template %s",
+                template_info = ""
+                if value_template is not None:
+                    template_info = f", template output: '{payload}', with value template '{str(value_template)}'"
+                _LOGGER.info(
+                    "No matching payload found for entity: %s with state topic: %s. Payload: '%s'%s",
                     self._config[CONF_NAME],
                     self._config[CONF_STATE_TOPIC],
-                    payload,
-                    value_template,
+                    msg.payload,
+                    template_info,
                 )
                 return
 
@@ -229,9 +248,10 @@ class MqttBinarySensor(
         )
         await MqttAttributes.async_will_remove_from_hass(self)
         await MqttAvailability.async_will_remove_from_hass(self)
+        await MqttDiscoveryUpdate.async_will_remove_from_hass(self)
 
     @callback
-    def value_is_expired(self, *_):
+    def _value_is_expired(self, *_):
         """Triggered when value is expired."""
 
         self._expiration_trigger = None

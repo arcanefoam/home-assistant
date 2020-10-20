@@ -31,7 +31,7 @@ import homeassistant.helpers.config_validation as cv
 import homeassistant.helpers.device_registry as dr
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import async_track_state_change
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.json import JSONEncoder
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.template import Template
@@ -39,20 +39,11 @@ from homeassistant.helpers.typing import ConfigType, HomeAssistantType
 
 # Import config flow so that it's added to the registry
 from .config_flow import EsphomeFlowHandler  # noqa: F401
-from .entry_data import (
-    DATA_KEY,
-    DISPATCHER_ON_DEVICE_UPDATE,
-    DISPATCHER_ON_LIST,
-    DISPATCHER_ON_STATE,
-    DISPATCHER_REMOVE_ENTITY,
-    DISPATCHER_UPDATE_ENTITY,
-    RuntimeEntryData,
-)
+from .entry_data import DATA_KEY, RuntimeEntryData
 
 DOMAIN = "esphome"
 _LOGGER = logging.getLogger(__name__)
 
-STORAGE_KEY = "esphome.{}"
 STORAGE_VERSION = 1
 
 # No config schema - only configuration entry
@@ -85,7 +76,7 @@ async def async_setup_entry(hass: HomeAssistantType, entry: ConfigEntry) -> bool
 
     # Store client in per-config-entry hass.data
     store = Store(
-        hass, STORAGE_VERSION, STORAGE_KEY.format(entry.entry_id), encoder=JSONEncoder
+        hass, STORAGE_VERSION, f"esphome.{entry.entry_id}", encoder=JSONEncoder
     )
     entry_data = hass.data[DATA_KEY][entry.entry_id] = RuntimeEntryData(
         client=cli, entry_id=entry.entry_id, store=store
@@ -123,14 +114,16 @@ async def async_setup_entry(hass: HomeAssistantType, entry: ConfigEntry) -> bool
                     template.render_complex(data_template, service.variables)
                 )
             except TemplateError as ex:
-                _LOGGER.error("Error rendering data template: %s", ex)
+                _LOGGER.error("Error rendering data template for %s: %s", host, ex)
                 return
 
         if service.is_event:
             # ESPHome uses servicecall packet for both events and service calls
             # Ensure the user can only send events of form 'esphome.xyz'
             if domain != "esphome":
-                _LOGGER.error("Can only generate events under esphome domain!")
+                _LOGGER.error(
+                    "Can only generate events under esphome domain! (%s)", host
+                )
                 return
             hass.bus.async_fire(service.service, service_data)
         else:
@@ -140,23 +133,32 @@ async def async_setup_entry(hass: HomeAssistantType, entry: ConfigEntry) -> bool
                 )
             )
 
-    async def send_home_assistant_state(
-        entity_id: str, _, new_state: Optional[State]
-    ) -> None:
-        """Forward Home Assistant states to ESPHome."""
+    async def send_home_assistant_state_event(event: Event) -> None:
+        """Forward Home Assistant states updates to ESPHome."""
+        new_state = event.data.get("new_state")
         if new_state is None:
             return
+        entity_id = event.data.get("entity_id")
+        await cli.send_home_assistant_state(entity_id, new_state.state)
+
+    async def _send_home_assistant_state(
+        entity_id: str, new_state: Optional[State]
+    ) -> None:
+        """Forward Home Assistant states to ESPHome."""
         await cli.send_home_assistant_state(entity_id, new_state.state)
 
     @callback
     def async_on_state_subscription(entity_id: str) -> None:
         """Subscribe and forward states for requested entities."""
-        unsub = async_track_state_change(hass, entity_id, send_home_assistant_state)
-        entry_data.disconnect_callbacks.append(unsub)
-        # Send initial state
-        hass.async_create_task(
-            send_home_assistant_state(entity_id, None, hass.states.get(entity_id))
+        unsub = async_track_state_change_event(
+            hass, [entity_id], send_home_assistant_state_event
         )
+        entry_data.disconnect_callbacks.append(unsub)
+        new_state = hass.states.get(entity_id)
+        if new_state is None:
+            return
+        # Send initial state
+        hass.async_create_task(_send_home_assistant_state(entity_id, new_state))
 
     async def on_login() -> None:
         """Subscribe to states and list entities on successful API login."""
@@ -175,7 +177,7 @@ async def async_setup_entry(hass: HomeAssistantType, entry: ConfigEntry) -> bool
 
             hass.async_create_task(entry_data.async_save_to_store())
         except APIConnectionError as err:
-            _LOGGER.warning("Error getting initial data: %s", err)
+            _LOGGER.warning("Error getting initial data for %s: %s", host, err)
             # Re-connection logic will trigger after this
             await cli.disconnect()
 
@@ -232,7 +234,7 @@ async def _setup_auto_reconnect_logic(
             # really short reconnect interval.
             tries = min(tries, 10)  # prevent OverflowError
             wait_time = int(round(min(1.8 ** tries, 60.0)))
-            _LOGGER.info("Trying to reconnect in %s seconds", wait_time)
+            _LOGGER.info("Trying to reconnect to %s in %s seconds", host, wait_time)
             await asyncio.sleep(wait_time)
 
         try:
@@ -403,7 +405,7 @@ async def platform_async_setup_entry(
         # Add entities to Home Assistant
         async_add_entities(add_entities)
 
-    signal = DISPATCHER_ON_LIST.format(entry_id=entry.entry_id)
+    signal = f"esphome_{entry.entry_id}_on_list"
     entry_data.cleanup_callbacks.append(
         async_dispatcher_connect(hass, signal, async_list_entities)
     )
@@ -416,7 +418,7 @@ async def platform_async_setup_entry(
         entry_data.state[component_key][state.key] = state
         entry_data.async_update_entity(hass, component_key, state.key)
 
-    signal = DISPATCHER_ON_STATE.format(entry_id=entry.entry_id)
+    signal = f"esphome_{entry.entry_id}_on_state"
     entry_data.cleanup_callbacks.append(
         async_dispatcher_connect(hass, signal, async_entity_state)
     )
@@ -490,28 +492,36 @@ class EsphomeEntity(Entity):
         self._remove_callbacks.append(
             async_dispatcher_connect(
                 self.hass,
-                DISPATCHER_UPDATE_ENTITY.format(**kwargs),
+                (
+                    f"esphome_{kwargs.get('entry_id')}"
+                    f"_update_{kwargs.get('component_key')}_{kwargs.get('key')}"
+                ),
                 self._on_state_update,
             )
         )
 
         self._remove_callbacks.append(
             async_dispatcher_connect(
-                self.hass, DISPATCHER_REMOVE_ENTITY.format(**kwargs), self.async_remove
+                self.hass,
+                (
+                    f"esphome_{kwargs.get('entry_id')}_remove_"
+                    f"{kwargs.get('component_key')}_{kwargs.get('key')}"
+                ),
+                self.async_remove,
             )
         )
 
         self._remove_callbacks.append(
             async_dispatcher_connect(
                 self.hass,
-                DISPATCHER_ON_DEVICE_UPDATE.format(**kwargs),
+                f"esphome_{kwargs.get('entry_id')}_on_device_update",
                 self._on_device_update,
             )
         )
 
     async def _on_state_update(self) -> None:
         """Update the entity state when state or static info changed."""
-        self.async_schedule_update_ha_state()
+        self.async_write_ha_state()
 
     async def _on_device_update(self) -> None:
         """Update the entity state when device info has changed."""
@@ -520,7 +530,7 @@ class EsphomeEntity(Entity):
             # Only update the HA state when the full state arrives
             # through the next entity state packet.
             return
-        self.async_schedule_update_ha_state()
+        self.async_write_ha_state()
 
     async def async_will_remove_from_hass(self) -> None:
         """Unregister callbacks."""

@@ -17,7 +17,7 @@ from homeassistant.components.cover import (
     SUPPORT_SET_TILT_POSITION,
     SUPPORT_STOP,
     SUPPORT_STOP_TILT,
-    CoverDevice,
+    CoverEntity,
 )
 from homeassistant.const import (
     CONF_DEVICE_CLASS,
@@ -26,8 +26,10 @@ from homeassistant.const import (
     CONF_FRIENDLY_NAME,
     CONF_ICON_TEMPLATE,
     CONF_OPTIMISTIC,
+    CONF_UNIQUE_ID,
     CONF_VALUE_TEMPLATE,
     EVENT_HOMEASSISTANT_START,
+    MATCH_ALL,
     STATE_CLOSED,
     STATE_OPEN,
 )
@@ -35,7 +37,7 @@ from homeassistant.core import callback
 from homeassistant.exceptions import TemplateError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import async_generate_entity_id
-from homeassistant.helpers.event import async_track_state_change
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.script import Script
 
 from . import extract_entities, initialise_templates
@@ -65,30 +67,34 @@ TILT_FEATURES = (
     | SUPPORT_SET_TILT_POSITION
 )
 
-COVER_SCHEMA = vol.Schema(
-    {
-        vol.Inclusive(OPEN_ACTION, CONF_OPEN_OR_CLOSE): cv.SCRIPT_SCHEMA,
-        vol.Inclusive(CLOSE_ACTION, CONF_OPEN_OR_CLOSE): cv.SCRIPT_SCHEMA,
-        vol.Optional(STOP_ACTION): cv.SCRIPT_SCHEMA,
-        vol.Exclusive(
-            CONF_POSITION_TEMPLATE, CONF_VALUE_OR_POSITION_TEMPLATE
-        ): cv.template,
-        vol.Exclusive(
-            CONF_VALUE_TEMPLATE, CONF_VALUE_OR_POSITION_TEMPLATE
-        ): cv.template,
-        vol.Optional(CONF_AVAILABILITY_TEMPLATE): cv.template,
-        vol.Optional(CONF_POSITION_TEMPLATE): cv.template,
-        vol.Optional(CONF_TILT_TEMPLATE): cv.template,
-        vol.Optional(CONF_ICON_TEMPLATE): cv.template,
-        vol.Optional(CONF_ENTITY_PICTURE_TEMPLATE): cv.template,
-        vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
-        vol.Optional(CONF_OPTIMISTIC): cv.boolean,
-        vol.Optional(CONF_TILT_OPTIMISTIC): cv.boolean,
-        vol.Optional(POSITION_ACTION): cv.SCRIPT_SCHEMA,
-        vol.Optional(TILT_ACTION): cv.SCRIPT_SCHEMA,
-        vol.Optional(CONF_FRIENDLY_NAME): cv.string,
-        vol.Optional(CONF_ENTITY_ID): cv.entity_ids,
-    }
+COVER_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Inclusive(OPEN_ACTION, CONF_OPEN_OR_CLOSE): cv.SCRIPT_SCHEMA,
+            vol.Inclusive(CLOSE_ACTION, CONF_OPEN_OR_CLOSE): cv.SCRIPT_SCHEMA,
+            vol.Optional(STOP_ACTION): cv.SCRIPT_SCHEMA,
+            vol.Exclusive(
+                CONF_POSITION_TEMPLATE, CONF_VALUE_OR_POSITION_TEMPLATE
+            ): cv.template,
+            vol.Exclusive(
+                CONF_VALUE_TEMPLATE, CONF_VALUE_OR_POSITION_TEMPLATE
+            ): cv.template,
+            vol.Optional(CONF_AVAILABILITY_TEMPLATE): cv.template,
+            vol.Optional(CONF_POSITION_TEMPLATE): cv.template,
+            vol.Optional(CONF_TILT_TEMPLATE): cv.template,
+            vol.Optional(CONF_ICON_TEMPLATE): cv.template,
+            vol.Optional(CONF_ENTITY_PICTURE_TEMPLATE): cv.template,
+            vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
+            vol.Optional(CONF_OPTIMISTIC): cv.boolean,
+            vol.Optional(CONF_TILT_OPTIMISTIC): cv.boolean,
+            vol.Optional(POSITION_ACTION): cv.SCRIPT_SCHEMA,
+            vol.Optional(TILT_ACTION): cv.SCRIPT_SCHEMA,
+            vol.Optional(CONF_FRIENDLY_NAME): cv.string,
+            vol.Optional(CONF_ENTITY_ID): cv.entity_ids,
+            vol.Optional(CONF_UNIQUE_ID): cv.string,
+        }
+    ),
+    cv.has_at_least_one_key(OPEN_ACTION, POSITION_ACTION),
 )
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
@@ -117,12 +123,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         tilt_action = device_config.get(TILT_ACTION)
         optimistic = device_config.get(CONF_OPTIMISTIC)
         tilt_optimistic = device_config.get(CONF_TILT_OPTIMISTIC)
-
-        if position_action is None and open_action is None:
-            _LOGGER.error(
-                "Must specify at least one of %s" or "%s", OPEN_ACTION, POSITION_ACTION
-            )
-            continue
+        unique_id = device_config.get(CONF_UNIQUE_ID)
 
         templates = {
             CONF_VALUE_TEMPLATE: state_template,
@@ -134,7 +135,9 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         }
 
         initialise_templates(hass, templates)
-        entity_ids = extract_entities(device, "cover", None, templates)
+        entity_ids = extract_entities(
+            device, "cover", device_config.get(CONF_ENTITY_ID), templates
+        )
 
         covers.append(
             CoverTemplate(
@@ -156,17 +159,14 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
                 optimistic,
                 tilt_optimistic,
                 entity_ids,
+                unique_id,
             )
         )
-    if not covers:
-        _LOGGER.error("No covers added")
-        return False
 
     async_add_entities(covers)
-    return True
 
 
-class CoverTemplate(CoverDevice):
+class CoverTemplate(CoverEntity):
     """Representation of a Template cover."""
 
     def __init__(
@@ -189,6 +189,7 @@ class CoverTemplate(CoverDevice):
         optimistic,
         tilt_optimistic,
         entity_ids,
+        unique_id,
     ):
         """Initialize the Template cover."""
         self.hass = hass
@@ -226,34 +227,24 @@ class CoverTemplate(CoverDevice):
         self._tilt_value = None
         self._entities = entity_ids
         self._available = True
-
-        if self._template is not None:
-            self._template.hass = self.hass
-        if self._position_template is not None:
-            self._position_template.hass = self.hass
-        if self._tilt_template is not None:
-            self._tilt_template.hass = self.hass
-        if self._icon_template is not None:
-            self._icon_template.hass = self.hass
-        if self._entity_picture_template is not None:
-            self._entity_picture_template.hass = self.hass
-        if self._availability_template is not None:
-            self._availability_template.hass = self.hass
+        self._unique_id = unique_id
 
     async def async_added_to_hass(self):
         """Register callbacks."""
 
         @callback
-        def template_cover_state_listener(entity, old_state, new_state):
+        def template_cover_state_listener(event):
             """Handle target device state changes."""
             self.async_schedule_update_ha_state(True)
 
         @callback
         def template_cover_startup(event):
             """Update template on startup."""
-            async_track_state_change(
-                self.hass, self._entities, template_cover_state_listener
-            )
+            if self._entities != MATCH_ALL:
+                # Track state change only for valid templates
+                async_track_state_change_event(
+                    self.hass, self._entities, template_cover_state_listener
+                )
 
             self.async_schedule_update_ha_state(True)
 
@@ -265,6 +256,11 @@ class CoverTemplate(CoverDevice):
     def name(self):
         """Return the name of the cover."""
         return self._name
+
+    @property
+    def unique_id(self):
+        """Return the unique id of this cover."""
+        return self._unique_id
 
     @property
     def is_closed(self):
@@ -315,7 +311,7 @@ class CoverTemplate(CoverDevice):
         if self._position_script is not None:
             supported_features |= SUPPORT_SET_POSITION
 
-        if self.current_cover_tilt_position is not None:
+        if self._tilt_script is not None:
             supported_features |= TILT_FEATURES
 
         return supported_features
@@ -340,7 +336,7 @@ class CoverTemplate(CoverDevice):
             )
         if self._optimistic:
             self._position = 100
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
     async def async_close_cover(self, **kwargs):
         """Move the cover down."""
@@ -352,7 +348,7 @@ class CoverTemplate(CoverDevice):
             )
         if self._optimistic:
             self._position = 0
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
     async def async_stop_cover(self, **kwargs):
         """Fire the stop action."""
@@ -366,7 +362,7 @@ class CoverTemplate(CoverDevice):
             {"position": self._position}, context=self._context
         )
         if self._optimistic:
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
     async def async_open_cover_tilt(self, **kwargs):
         """Tilt the cover open."""
@@ -375,7 +371,7 @@ class CoverTemplate(CoverDevice):
             {"tilt": self._tilt_value}, context=self._context
         )
         if self._tilt_optimistic:
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
     async def async_close_cover_tilt(self, **kwargs):
         """Tilt the cover closed."""
@@ -384,7 +380,7 @@ class CoverTemplate(CoverDevice):
             {"tilt": self._tilt_value}, context=self._context
         )
         if self._tilt_optimistic:
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
     async def async_set_cover_tilt_position(self, **kwargs):
         """Move the cover tilt to a specific position."""
@@ -393,7 +389,7 @@ class CoverTemplate(CoverDevice):
             {"tilt": self._tilt_value}, context=self._context
         )
         if self._tilt_optimistic:
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
     async def async_update(self):
         """Update the state from the template."""
@@ -465,7 +461,7 @@ class CoverTemplate(CoverDevice):
                 ):
                     # Common during HA startup - so just a warning
                     _LOGGER.warning(
-                        "Could not render %s template %s, the state is unknown.",
+                        "Could not render %s template %s, the state is unknown",
                         friendly_property_name,
                         self._name,
                     )

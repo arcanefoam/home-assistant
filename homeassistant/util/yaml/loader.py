@@ -41,7 +41,6 @@ def clear_secret_cache() -> None:
     __SECRET_CACHE.clear()
 
 
-# pylint: disable=too-many-ancestors
 class SafeLineLoader(yaml.SafeLoader):
     """Loader class that keeps track of line numbers."""
 
@@ -87,9 +86,6 @@ def _add_reference(
     obj: DICT_T, loader: yaml.SafeLoader, node: yaml.nodes.Node
 ) -> DICT_T:
     ...
-
-
-# pylint: enable=pointless-statement
 
 
 def _add_reference(  # type: ignore
@@ -211,7 +207,7 @@ def _ordered_dict(loader: SafeLineLoader, node: yaml.nodes.MappingNode) -> Order
         if key in seen:
             fname = getattr(loader.stream, "name", "")
             _LOGGER.warning(
-                'YAML file %s contains duplicate key "%s". ' "Check lines %d and %d.",
+                'YAML file %s contains duplicate key "%s". Check lines %d and %d',
                 fname,
                 key,
                 seen[key],
@@ -237,7 +233,7 @@ def _env_var_yaml(loader: SafeLineLoader, node: yaml.nodes.Node) -> str:
         return os.getenv(args[0], " ".join(args[1:]))
     if args[0] in os.environ:
         return os.environ[args[0]]
-    _LOGGER.error("Environment variable %s not defined.", node.value)
+    _LOGGER.error("Environment variable %s not defined", node.value)
     raise HomeAssistantError(node.value)
 
 
@@ -296,7 +292,7 @@ def secret_yaml(loader: SafeLineLoader, node: yaml.nodes.Node) -> JSON_TYPE:
             _LOGGER.debug("Secret %s retrieved from keyring", node.value)
             return pwd
 
-    global credstash  # pylint: disable=invalid-name
+    global credstash  # pylint: disable=invalid-name, global-statement
 
     if credstash:
         # pylint: disable=no-member
