@@ -20,6 +20,8 @@ from homeassistant.helpers.event import (
     async_track_state_change,
     async_track_time_interval,
 )
+from homeassistant.util.dt import as_local
+
 from .const import (
     CONF_WEEKDAYS,
     DEFAULT_AWAY_TEMP,
@@ -30,7 +32,7 @@ from .const import (
 from .schedule import Schedule, Rule
 from .util import RangingSet
 
-_LOGGER = logging.getLogger(__name__)
+_log = logging.getLogger(__name__)
 
 Thermostat = namedtuple('Thermostat', ['entity_id', 'weight'])
 BOOST_UP = 2
@@ -81,24 +83,22 @@ class Room:
     def __init__(self, name=None, valves=None, schedule: Schedule = None):
         if valves is None:
             valves = []
-        self.hass = None
+        self._hass = None
         self.schedule = schedule
-        self.away_temp = DEFAULT_AWAY_TEMP
-        self.boost_all_temp = None
-        self.valve_boost = RoomValveBoost()
-        self.manual_temp = None
-        self.set_point = None
+        self._away_temp = DEFAULT_AWAY_TEMP
+        self._boost_all_temp = None
+        self._manual_temp = None
+        self._setpoint = 20
         self._name = name
         self._heating = False
-        self._valves = [v.entity_id for v in valves]
-        self._room_temp = RoomTemperature(valves={v.entity_id: v.weight for v in valves})
+        self._valves = Valves(valves={v.entity_id: v.weight for v in valves})
         self._valve_boost_timer_remove = None
         self._room_boost_timer_remove = None
         self._state = Auto()
         self._temp_lock = asyncio.Lock()
         if not self.schedule.rules:   # Create default rules
             # Week days
-            self._schedule.rules.append(
+            self.schedule.rules.append(
                 Rule(
                     value=20,
                     name="wd morning",
@@ -107,7 +107,7 @@ class Room:
                     constraints={CONF_WEEKDAYS: RangingSet(range(1, 6))}
                 )
             )
-            self._schedule.rules.append(
+            self.schedule.rules.append(
                 Rule(
                     value=16,
                     name="wd day",
@@ -116,7 +116,7 @@ class Room:
                     constraints={CONF_WEEKDAYS: RangingSet(range(1, 6))}
                 )
             )
-            self._schedule.rules.append(
+            self.schedule.rules.append(
                 Rule(
                     value=21,
                     name="wd evening",
@@ -126,7 +126,7 @@ class Room:
                 )
             )
             # Weekends
-            self._schedule.rules.append(
+            self.schedule.rules.append(
                 Rule(
                     value=20,
                     name="we morning",
@@ -135,7 +135,7 @@ class Room:
                     constraints={CONF_WEEKDAYS: RangingSet({6, 7})}
                 )
             )
-            self._schedule.rules.append(
+            self.schedule.rules.append(
                 Rule(
                     value=18,
                     name="we day",
@@ -144,7 +144,7 @@ class Room:
                     constraints={CONF_WEEKDAYS: RangingSet({6, 7})}
                 )
             )
-            self._schedule.rules.append(
+            self.schedule.rules.append(
                 Rule(
                     value=21,
                     name="evening",
@@ -154,12 +154,16 @@ class Room:
                 )
             )
             # Default
-            self._schedule.rules.append(
+            self.schedule.rules.append(
                 Rule(
                     value=OFF_VALUE,
                     name="sleep",
                 )
             )
+
+    def __str__(self):
+        return f'{self._name}@{self._state}, sp={self._setpoint}'
+
 
     @property
     def name(self):
@@ -167,12 +171,24 @@ class Room:
 
     @property
     def room_temp(self):
-        return self._room_temp.room_temp()
+        return self._valves.room_temp
 
     @property
-    def boost(self):
-        boost, _ = self.valve_boost.has_boost()
-        return boost
+    def valve_boost(self):
+        boost, _ = self._valves.has_boost()
+        return boost != 0
+
+    @property
+    def setpoint(self):
+        return self._setpoint
+
+    @property
+    def away_temp(self):
+        return self._away_temp
+
+    @property
+    def boost_all_temp(self):
+        return self._boost_all_temp
 
     def format_room_temp(self):
         return f'{self.room_temp:.1f}'
@@ -180,118 +196,178 @@ class Room:
     def demands_heat(self):
         return self._heating
 
+    def attributes(self):
+        boost, _ = self._valves.has_boost()
+        return {
+            "name": self._name,
+            "temperature": self.room_temp,
+            "setpoint": self._setpoint if self._setpoint > 5 else OFF_VALUE,
+            "heating": self._heating,
+            "valve_boost": boost,
+            "manual": isinstance(self._state, Manual)
+        }
+
     @callback
     def track_valves(self, hass):
         """
         Request state tracking for room thermostats.
         Called when house is added to Hass
         """
-        self.hass = hass
-        for t_id in self._valves:
-            async_track_state_change(
-                hass, t_id, self._async_thermostat_changed
-            )
+        self._hass = hass
+        self._valves.track_state_change(hass, self._async_valve_state_change)
 
     @callback
     def validate_value(self, value):
         return value
 
-    async def _async_thermostat_changed(self, entity_id: str, old_state: State, new_state: State) -> None:
-        """Handle thermostat state changes."""
+    @callback
+    def valve_boost_set_point(self):
+        _, temp = self._valves.has_boost()
+        return temp
+
+    async def _async_valve_state_change(self, entity_id: str, old_state: State, new_state: State) -> None:
+        """ Handle thermostat state changes. """
         if new_state is None:
             return
-        await self.valve_state(entity_id, new_state)
+        self._valves.update_state(entity_id, new_state)
+        self._valves.detect_boost(entity_id, self._setpoint)
+        await self._async_send_set_point(entity_id)
 
-    async def valve_state(self, entity_id, new_state):
-        await self._async_update_state(entity_id, new_state)
-        await self._async_detect_boost(entity_id, new_state)
-        await self._async_send_setpoint(entity_id)
-
-    async def _async_update_state(self, entity_id, state):
-        """ Update the valve(s) state """
-        if entity_id in self._valves:
-            self._room_temp.async_local_temp(entity_id, state)
-
-    async def _async_detect_boost(self, entity_id, state):
-        """ Update the valve(s) state """
-        if entity_id in self._valves:
-            await self.valve_boost.async_valve_boost(entity_id, state, self.room_temp)
-
-    async def async_tick(self, time):
-        if not isinstance(self._state, Away) and self.boost:
-            self._state = self._state.on_event(Event.VALVE_BOOST)
-            self._valve_boost_timer_remove = async_track_time_interval(
-                self.hass,
-                self._async_valve_boost_end,
-                datetime.timedelta(hours=1))
-        self._do_heating(time)
-
-    @callback
-    def _do_heating(self, time):
-        self.set_point = await self._state.target_temp(self, time)
-        self._heating = self.room_temp.determine_heating(self.set_point)
-        _LOGGER.info("Room %s demands heat: %s", self._name, self._heating)
-
-    def attributes(self):
-        return {
-            "name": self._name,
-            "temperature": self.room_temp,
-            "setpoint": self.set_point if self.set_point > 5 else OFF_VALUE,
-            "heating": self._heating,
-            "valve_boost": self.boost
-        }
-
-    async def async_away_mode(self, away, setpoint):
-        self.away_temp = setpoint
-        self._state = self._state.on_event(Event.AWAY_ON if away else Event.AWAY_OFF)
-        self._do_heating(datetime.datetime.now())
-
-    async def async_boost_all_mode(self, boost):
-        self.boost_all_temp = self.room_temp
-        self._state = self._state.on_event(Event.BOOST_ALL if boost else Event.CANCEL_ALL)
-        self._do_heating(datetime.datetime.now())
-
-    async def async_manual(self, manual, setpoint):
-        self.manual_temp = setpoint
-        self._state = self._state.on_event(Event.MANUAL if manual else Event.AUTO)
-        self._do_heating(datetime.datetime.now())
-
-    async def async_boost_room(self, setpoint, duration):
-        if duration == 0:
-            await self.async_auto_mode()
-        else:
-            self.manual_temp = setpoint
-            self._room_boost_timer_remove = async_track_time_interval(
-                self.hass,
-                self._async_room_boost_end,
-                datetime.timedelta(hours=1))
-            self._state = self._state.on_event(Event.ROOM_BOOST)
-        self._do_heating(datetime.datetime.now())
-
-    async def async_auto_mode(self):
-        self._state = self._state.on_event(Event.AUTO)
-        self._do_heating(datetime.datetime.now())
-
-    async def _async_valve_boost_end(self, **kwargs):
-        self._valve_boost_timer_remove()
-        self._state = self._state.on_event(Event.AUTO)
-        self._do_heating(datetime.datetime.now())
-
-    async def _async_room_boost_end(self, **kwargs):
-        self._room_boost_timer_remove()
-        self._state = self._state.on_event(Event.AUTO)
-        self._do_heating(datetime.datetime.now())
-
-    async def _async_send_setpoint(self, entity_id):
+    async def _async_send_set_point(self, entity_id):
+        """ Send the current set-point to all the valves """
         async with self._temp_lock:
             data = {
                 ATTR_ENTITY_ID: entity_id,
-                ATTR_TEMPERATURE: self.set_point
+                ATTR_TEMPERATURE: self._setpoint
             }
-            await self.hass.services.async_call(CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE, data)
+            await self._hass.services.async_call(CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE, data)
+
+    async def _async_determine_heating(self, time):
+        """
+        Determine if the room requires heating based on the desired set-point (from the current state) and the room
+        temperature
+        :param time: the current time.
+        """
+        new_setpoint = await self._state.setpoint(self,  as_local(time))
+        _log.debug("determine_heating %s, new_sp = %s, time = %s", self, new_setpoint, as_local(time))
+        if new_setpoint is not None:
+            old_setpoint = self._setpoint
+            self._setpoint = new_setpoint
+            if old_setpoint != new_setpoint:
+                self._valves.schedule_setpoint(new_setpoint)
+            self._heating = self._valves.determine_heating(self._setpoint)
+            _log.info("Room %s demands heat: %s", self, self._heating)
+
+    async def async_tick(self, time):
+        """
+        Called by the house on its 'control heater' timer. Schedule changes are calculated here.
+        If the state is not Away and there is a valve boost, respond
+        :param time:
+        :return:
+        """
+        await self._async_determine_heating(time)
+        if not isinstance(self._state, Away) and not isinstance(self._state, ValveBoost) and self.valve_boost:
+            _log.info("Room %s has valve boost", self.name)
+            self._room_boost_timer_remove = None    # Cancel room boost
+            self._state = self._state.on_event(Event.VALVE_BOOST)
+            self._valve_boost_timer_remove = async_track_time_interval(
+                self._hass,
+                self.async_valve_boost_end,
+                datetime.timedelta(hours=1))
+
+    async def async_away_mode_event(self, away, set_point):
+        """
+        Called by the house when set to away mode
+        :param away: True if set to away.
+        :param set_point: The away set-point
+        """
+        _log.info("Room %s away mode: %s", self, set_point)
+        self._away_temp = set_point
+        self._state = self._state.on_event(Event.AWAY_ON if away else Event.AWAY_OFF)
+        await self._async_determine_heating(as_local(datetime.datetime.now()))
+
+    async def async_boost_all_mode_event(self, boost):
+        """
+        Called when the house when a boost-all is requested. The boost set-point will be the current room temperature
+        + 2°C
+        :param boost: True if boost requested
+        """
+        _log.info("Room %s boost all mode: %s", self, boost)
+        self._boost_all_temp = self.room_temp + (2 if boost else 0)
+        self._state = self._state.on_event(Event.BOOST_ALL if boost else Event.CANCEL_ALL)
+        await self._async_determine_heating(as_local(datetime.datetime.now()))
+
+    async def async_manual_temp_event(self, manual, set_point):
+        """
+        Called when the room temperature is set manually (via UI)
+        :param manual:
+        :param set_point:
+        :return:
+        """
+        _log.info("Room %s manual temp: %s", self, set_point)
+        self._manual_temp = set_point
+        self._state = self._state.on_event(Event.MANUAL if manual else Event.AUTO)
+        await self._async_determine_heating(as_local(datetime.datetime.now()))
+
+    async def async_boost_room_event(self, set_point, duration):
+        """
+        Called when the room is set to boost (via UI).
+        :param set_point: The target set-point
+        :param duration: The duration of the boost: 30, 60 (1hr), 120 (2hr) or 180(3hr). If 0, boost is cancelled.
+        """
+        _log.info("Room %s boost_room temp: %s for %d", self, set_point, duration)
+        if duration == 0:
+            await self.async_auto_mode_event()
+        else:
+            self._valve_boost_timer_remove = None   # Cancel valve boost
+            self._manual_temp = set_point
+            self._room_boost_timer_remove = async_track_time_interval(
+                self._hass,
+                self.async_room_boost_end,
+                datetime.timedelta(minutes=duration))
+            self._state = self._state.on_event(Event.ROOM_BOOST)
+        await self._async_determine_heating(as_local(datetime.datetime.now()))
+
+    async def async_auto_mode_event(self):
+        """
+        Called when the room is set to auto mode. This can be via the room UI or the house 'Cancel all'
+        """
+        _log.info("Room %s auto mode", self)
+        self._setpoint = self.room_temp
+        self._state = self._state.on_event(Event.AUTO)
+        await self._async_determine_heating(as_local(datetime.datetime.now()))
+
+    async def async_valve_boost_end(self, *args):
+        """
+        Listener for ending the valve boost.
+        :param kwargs: other event values
+        """
+        _log.info("Room %s boost end", self)
+        if self._valve_boost_timer_remove is not None:
+            self._valve_boost_timer_remove()
+        self._valve_boost_timer_remove = None
+        self._state = self._state.on_event(Event.AUTO)
+        await self._async_determine_heating(as_local(datetime.datetime.now()))
+
+    async def async_room_boost_end(self, *args):
+        """
+        Listener for ending the room boost
+        :param kwargs:
+        :return:
+        """
+        _log.debug("async_room_boost_end")
+        if self._room_boost_timer_remove is not None:
+            self._room_boost_timer_remove()
+        self._room_boost_timer_remove = None
+        self._state = self._state.on_event(Event.AUTO)
+        await self._async_determine_heating(as_local(datetime.datetime.now()))
 
 
-class RoomTemperature:
+class Valves:
+    """
+    Represents a group of valves in a room. The temperature of the room and the valve boost is aggregated from
+    all the valves in the group
+    """
 
     def __init__(self, valves=None, temp_direction=TempDirection.NONE, room_temp=20):
         if valves is None:
@@ -300,71 +376,124 @@ class RoomTemperature:
         self._room_temp = room_temp
         self._temp_direction = temp_direction
         self._weight_sum = sum(self._valves.values())
-
-    @callback
-    def async_local_temp(self, entity_id, state):
-        # Local temperature
-        try:
-            local_temp = state.attributes["local_temperature"]
-            prev_temp = self._room_temp
-            if len(self._valves) == 1:
-                self._room_temp = local_temp
-            else:
-                self._room_temp -= (self._room_temp * self._valves[entity_id]) / self._weight_sum
-                self._room_temp += (local_temp * self._valves[entity_id]) / self._weight_sum
-            if prev_temp > self._room_temp:
-                self._temp_direction = TempDirection.COOLING
-            elif prev_temp <= self._room_temp:
-                self._temp_direction = TempDirection.HEATING
-            else:
-                self._temp_direction = TempDirection.NONE
-        except KeyError:
-            pass
+        self._valve_set_point = {}
+        self._waiting_synch = {}
+        for t_id in self._valves:
+            self._waiting_synch[t_id] = False
+        self._waiting_synch_setpoint = None
+        self._valve_boost = {}
+        self._valve_boost_dir = 0
+        self._valve_boost_temp = None
+        self._schedule_changed = False
 
     @property
     def room_temp(self):
         return self._room_temp
 
     @callback
+    def update_state(self, entity_id, state):
+        """
+        Calculated the local temperature and store the valve state.
+        the weighted average
+        :param entity_id:
+        :param state:
+        :return:
+        """
+        if entity_id in self._valves:
+            try:
+                local_temp = state.attributes["local_temperature"]
+            except KeyError:
+                _log.warning("Valve state does not has local temperature information")
+            else:
+                prev_temp = self._room_temp
+                if len(self._valves) == 1:
+                    self._room_temp = local_temp
+                else:
+                    self._room_temp -= (self._room_temp * self._valves[entity_id]) / self._weight_sum
+                    self._room_temp += (local_temp * self._valves[entity_id]) / self._weight_sum
+                if prev_temp > self._room_temp:
+                    self._temp_direction = TempDirection.COOLING
+                elif prev_temp < self._room_temp:
+                    self._temp_direction = TempDirection.HEATING
+                else:
+                    self._temp_direction = TempDirection.NONE
+            try:
+                valve_set_point = state.attributes["occupied_heating_setpoint"]
+            except KeyError:
+                _log.warning("Valve state does not has occupied heating setpoint information")
+            else:
+                self._valve_set_point[entity_id] = valve_set_point
+                if self.waiting_synch() and (valve_set_point == self._waiting_synch_setpoint):
+                    # We where waiting for synch and it was received
+                    _log.debug("Valve synched %s", entity_id)
+                    self._waiting_synch[entity_id] = False
+            try:
+                self._valve_boost[entity_id] = state.attributes["boost"]
+            except KeyError:
+                _log.warning("Valve state does not has occupied heating setpoint information")
+
+    @callback
     def determine_heating(self, target_temp):
-        if self._temp_direction == TempDirection.HEATING:
-            return target_temp > self._room_temp
-        elif self._temp_direction == TempDirection.COOLING:
+        if self._temp_direction == TempDirection.COOLING:
             return target_temp > (self._room_temp + TEMP_HYSTERESIS)
         else:
-            return False
+            return target_temp > self._room_temp
 
+    @callback
+    def schedule_setpoint(self, setpoint):
+        for t_id in self._valves:
+            self._waiting_synch[t_id] = True
+        self._waiting_synch_setpoint = setpoint
 
-class RoomValveBoost:
-
-    def __init__(self, valve_set_point=None, valve_boost=False, valve_boost_delta=0):
-        if valve_set_point is None:
-            valve_set_point = {}
-        self._valve_set_point = valve_set_point
-        self._valve_boost = valve_boost
-        self._valve_boost_temp = valve_boost_delta
-
+    @callback
     def has_boost(self):
-        return self._valve_boost, self._valve_boost_temp
+        return self._valve_boost_dir, self._valve_boost_temp
 
-    async def async_valve_boost(self, entity_id, state, room_temp):
-        """ Is there a valve boost? """
-        prev_setpoint = self._valve_set_point[entity_id]
-        self._valve_set_point[entity_id] = setpoint = state.attributes["occupied_heating_setpoint"]
-        if not self._valve_boost:
-            delta = setpoint - prev_setpoint
-            # Valve boost is 2°
-            if delta > 1.5 and state.attributes["boost"] == "Up":
-                _LOGGER.info("%s BOOST UP", entity_id)
-                self._valve_boost_temp = room_temp + 2
-                self._valve_boost = True
-            elif delta < 1.5 and state.attributes["boost"] == "Down":
-                _LOGGER.info("%s BOOST DOWN", entity_id)
-                self._valve_boost_temp = room_temp - 2
-                self._valve_boost = True
-            else:
-                self._valve_boost_temp = room_temp
-                self._valve_boost = False
+    @callback
+    def detect_boost(self, entity_id, set_point):
+        """ Is there a valve boost?
+            Valves keep the boost flag 'ad infinitum', that is, once the user turns the boost, the valve's state
+            ("boost") attribute remains in the last turned-to position. Hence, the only way to detect a boost is if
+            the valve's set-point changes when the change does not come from us.
+        """
+        if not self.waiting_synch():
+            # We did not initiate the setpoint change
+            vale_setpoint = self._valve_set_point.get(entity_id, None)
+            if vale_setpoint is not None:
+                delta = set_point - vale_setpoint
+                _log.debug("Room valve %s boost delta %s", delta, entity_id)
+                # Valve boost is 2°
+                if delta < -1.5 and self._valve_boost[entity_id] == "Up":
+                    _log.debug("%s BOOST UP", entity_id)
+                    self._valve_boost_temp = self._room_temp + 2
+                    self._valve_boost_dir = "+"
+                    return
+                elif delta > 1.5 and self._valve_boost[entity_id] == "Down":
+                    _log.debug("%s BOOST DOWN", entity_id)
+                    self._valve_boost_temp = self._room_temp - 2
+                    self._valve_boost_dir = "-"
+                    return
+        self._valve_boost_temp = self._room_temp
+        self._valve_boost_dir = 0
+
+    @callback
+    def waiting_synch(self):
+        return any(self._waiting_synch.values())
+
+    def track_state_change(self, hass, method):
+        for t_id in self._valves:
+            async_track_state_change(hass, t_id, method)
+
+
+class Event(Enum):
+    AWAY_ON = auto()
+    AWAY_OFF = auto()
+    BOOST_ALL = auto()
+    CANCEL_ALL = auto()
+    VALVE_BOOST = auto()
+    MANUAL = auto()
+    ROOM_BOOST = auto()
+    AUTO = auto()
 
 
 class RoomState(object):
@@ -374,7 +503,7 @@ class RoomState(object):
     """
 
     def __init__(self):
-        print('Processing current state:', str(self))
+        _log.debug('Entering state %s', str(self))
 
     def on_event(self, event):
         """
@@ -382,7 +511,14 @@ class RoomState(object):
         """
         pass
 
-    async def target_temp(self, room, time):
+    async def setpoint(self, room, time):
+        """
+        Determines the target temperature. The target temperature is calculated
+        differently for each state.
+        :param room:
+        :param time:
+        :return:
+        """
         pass
 
     def __repr__(self):
@@ -398,17 +534,6 @@ class RoomState(object):
         return self.__class__.__name__
 
 
-class Event(Enum):
-    AWAY_ON = auto()
-    AWAY_OFF = auto()
-    BOOST_ALL = auto()
-    CANCEL_ALL = auto()
-    VALVE_BOOST = auto()
-    MANUAL = auto()
-    ROOM_BOOST = auto()
-    AUTO = auto()
-
-
 class Auto(RoomState):
     """
     The Room is in Auto mode, following the shcedule
@@ -420,17 +545,17 @@ class Auto(RoomState):
         elif event == Event.BOOST_ALL:
             return HouseBoost()
         elif event == Event.VALVE_BOOST:
-            return RoomValveBoost()
+            return ValveBoost()
         elif event == Event.ROOM_BOOST:
             return RoomBoost()
         return self
 
-    async def target_temp(self, room, time):
+    async def setpoint(self, room, time):
         result = None
         if room.schedule is not None:
-            result = await room.schedule.evaluate(self, time)
+            result = await room.schedule.evaluate(room, time)
         if result is None:
-            _LOGGER.warning("No suitable value found in schedule. Not changing set-points.")
+            _log.warning("No suitable value found in schedule. Not changing set-points.")
             result = room.set_point
         else:
             new_scheduled_value, _ = result[:2]
@@ -448,7 +573,7 @@ class Away(RoomState):
             return Auto()
         return self
 
-    async def target_temp(self, room, time):
+    async def setpoint(self, room, time):
         return room.away_temp
 
 
@@ -461,14 +586,14 @@ class HouseBoost(RoomState):
         if event == Event.CANCEL_ALL:
             return Auto()
         elif event == Event.VALVE_BOOST:
-            return RoomValveBoost()
+            return ValveBoost()
         elif event == Event.MANUAL:
             return Manual()
         elif event == Event.ROOM_BOOST:
             return RoomBoost()
         return self
 
-    async def target_temp(self, room, time):
+    async def setpoint(self, room, time):
         return room.boost_all_temp
 
 
@@ -484,9 +609,8 @@ class ValveBoost(RoomState):
             return Manual()
         return self
 
-    async def target_temp(self, room, time):
-        _, target_temp = room.valve_boost.has_boost()
-        return target_temp
+    async def setpoint(self, room, time):
+        return room.valve_boost_set_point()
 
 
 class Manual(RoomState):
@@ -500,12 +624,12 @@ class Manual(RoomState):
         elif event == Event.MANUAL:
             return Manual()
         elif event == Event.VALVE_BOOST:
-            return RoomValveBoost()
+            return ValveBoost()
         elif event == Event.AUTO:
             return Auto()
         return self
 
-    async def target_temp(self, room, time):
+    async def setpoint(self, room, time):
         return room.manual_temp
 
 
@@ -518,7 +642,7 @@ class RoomBoost(RoomState):
         if event == Event.AUTO:
             return Auto()
         elif event == Event.VALVE_BOOST:
-            return RoomValveBoost()
+            return ValveBoost()
 
-    async def target_temp(self, room, time):
+    async def setpoint(self, room, time):
         return room.manual_temp

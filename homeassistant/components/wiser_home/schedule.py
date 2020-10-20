@@ -17,7 +17,7 @@ from cached_property import cached_property
 from . import util
 from . import expression
 
-_LOGGER = logging.getLogger(__name__)
+_log = logging.getLogger(__name__)
 
 ScheduleEvaluationResultType = T.Tuple[T.Any, T.Set[str], "Rule"]
 
@@ -145,7 +145,7 @@ class Rule:
             return True
 
         year, week, weekday = date.isocalendar()
-        _LOGGER.debug("_check_constraints %s, %s, %s", year, week, weekday)
+        # _log.debug("_check_constraints %s, %s, %s", year, week, weekday)
         checks = {
             "years": lambda a: year in a,
             "months": lambda a: date.month in a,
@@ -155,7 +155,7 @@ class Rule:
             "start_date": lambda a: date >= util.build_date_from_constraint(a, date, 1),
             "end_date": lambda a: date <= util.build_date_from_constraint(a, date, -1),
         }
-        _LOGGER.debug("_check_constraints %s", self.constraints)
+        # _log.debug("_check_constraints %s", self.constraints)
         for constraint, allowed in self.constraints.items():
             if not checks[constraint](allowed):  # type: ignore
                 return False
@@ -437,11 +437,11 @@ class Schedule:
         def log(msg: str, path: RulePath, *args: T.Any, **kwargs: T.Any) -> None:
             """Wrapper around _LOGGER.debug that prefixes spaces to the
             message based on the length of the rule path."""
+            pass
+            # prefix = " " * 4 * max(0, len(path.rules) - 1) #+ "\u251c\u2500"
+            # _log.debug("{} {}".format(prefix, msg))
 
-            prefix = " " * 4 * max(0, len(path.rules) - 1) + "\u251c\u2500"
-            _LOGGER.debug("{} {}".format(prefix, msg))
-
-        _LOGGER.debug("Assuming it to be {}.".format(when))
+        # _log("Assuming it to be {}.".format(when))
 
         expr_cache = {}  # type: T.Dict[types.CodeType, T.Any]
         expr_env = None
@@ -483,7 +483,7 @@ class Schedule:
                             path
                         )
                     if isinstance(result, Exception):
-                        _LOGGER.error("Failed expression: {}".format(repr(rule.expr_raw)))
+                        _log.error("Failed expression: {}".format(repr(rule.expr_raw)))
                 elif rule.value is not None:
                     plain_value = True
                     result = rule.value
@@ -508,11 +508,11 @@ class Schedule:
                     break
 
             if result is None:
-                _LOGGER.warning(
+                _log.warning(
                     "No expression/value definition found, skipping {}.".format(path),
                 )
             elif isinstance(result, Exception):
-                _LOGGER.warning(
+                _log.warning(
                     "Evaluation failed, skipping {}.".format(path)
                 )
             elif isinstance(result, expression.types.Abort):
@@ -540,7 +540,7 @@ class Schedule:
                 if isinstance(result, expression.types.PostprocessorValueMixin):
                     value = room.validate_value(result.value)
                     if value is None:
-                        _LOGGER.debug("Aborting schedule evaluation.")
+                        # _log.debug("Aborting schedule evaluation.")
                         break
                     result.value = value
                 postprocessors.append(result)
@@ -550,46 +550,47 @@ class Schedule:
                 postprocessor_markers = set()  # type: T.Set[str]
                 result = room.validate_value(result)
                 if result is None and plain_value:
-                    _LOGGER.warning(
-                        "Maybe this is an expression? If so, set it "
-                        "as the rule's 'expression' parameter "
-                        "rather than as 'value'.",
-                    )
+                    pass
+                    # _log.warning(
+                    #     "Maybe this is an expression? If so, set it "
+                    #     "as the rule's 'expression' parameter "
+                    #     "rather than as 'value'.",
+                    # )
                 elif postprocessors:
-                    _LOGGER.debug("Applying postprocessors.")
+                    # _log.debug("Applying postprocessors.")
                     for postprocessor in postprocessors:
                         if result is None:
                             break
                         markers.update(postprocessor_markers)
                         postprocessor_markers.clear()
-                        _LOGGER.debug("+ {}".format(repr(postprocessor)))
+                        #_log.debug("+ {}".format(repr(postprocessor)))
                         try:
                             result = postprocessor.apply(result)
                         except expression.types.PostprocessingError as err:
-                            _LOGGER.debug(
-                                "Error while applying {} to result {}: {}".format(
-                                    repr(postprocessor), repr(result), err
-                                ),
-                            )
+                            # _log.debug(
+                            #     "Error while applying {} to result {}: {}".format(
+                            #         repr(postprocessor), repr(result), err
+                            #     ),
+                            # )
                             result = None
                             break
-                        _LOGGER.debug("= {}".format(repr(result)))
+                        #_log.debug("= {}".format(repr(result)))
                         if isinstance(result, expression.types.Mark):
                             result = result.unwrap(postprocessor_markers)
                         result = room.validate_value(result)
 
                 if result is None:
-                    _LOGGER.error("Aborting schedule evaluation.")
+                    #_log.error("Aborting schedule evaluation.")
                     break
                 markers.update(postprocessor_markers)
 
-                _LOGGER.debug(
-                    "Final result: {!r}, markers: {}".format(result, markers),
-                    
-                )
+                # _log.debug(
+                #     "Final result: {!r}, markers: {}".format(result, markers),
+                #
+                # )
                 return result, markers, last_rule
 
-        _LOGGER.debug("Found no result.")
+        #_log.debug("Found no result.")
         return None
 
     def get_next_scheduling_datetime(

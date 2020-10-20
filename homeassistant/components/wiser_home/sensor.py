@@ -73,11 +73,6 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         away_mode = call.data.get(ATTR_AWAY_MODE, False)
         await entity.async_set_away_mode(away_mode=away_mode)
 
-    async def handle_away_mode_service(call):
-        """Handle the service."""
-        away_mode = call.data.get(ATTR_AWAY_MODE, False)
-        await entity.async_set_away_mode(away_mode=away_mode)
-
     async def handle_boost_all_service(call):
         """Handle the service."""
         await entity.async_boost_all(call)
@@ -180,7 +175,7 @@ class WiserHome(RestoreEntity):
         for room in self.rooms:
             await room.async_tick(time)
 
-        self._attributes['rooms'] = [await room.attributes() for room in self.rooms]
+        self._attributes['rooms'] = [room.attributes() for room in self.rooms]
         if any(room.demands_heat() for room in self.rooms):
             _LOGGER.debug("At least one room needs heat, setting boiler on")
             await self._async_heater_turn_on()
@@ -200,17 +195,7 @@ class WiserHome(RestoreEntity):
         self._attributes['boiler'] = 'Off'
         await self.hass.services.async_call(HA_DOMAIN, SERVICE_TURN_OFF, data)
 
-
-
-
-
-
-
-
-
-
-
-    async def async_set_away_temp(self, **kwargs) -> None:
+    async def async_set_away_temp(self, *args, **kwargs) -> None:
         """Set new target temperature."""
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
@@ -221,7 +206,7 @@ class WiserHome(RestoreEntity):
         if self._away:
             await self._async_control_heater(time=datetime.datetime.now(), away=True)
 
-    async def async_set_away_mode(self, **kwargs):
+    async def async_set_away_mode(self, *args, **kwargs):
         """Set away mode."""
         away = kwargs.get(ATTR_AWAY_MODE)
         if away is None:
@@ -231,9 +216,9 @@ class WiserHome(RestoreEntity):
         else:
             self._mode = HeatingMode.AUTO
         for room in self.rooms:
-            await room.async_away_mode(away, self._away_temp)
+            await room.async_away_mode_event(away, self._away_temp)
 
-    async def async_boost_all(self, **kwargs):
+    async def async_boost_all(self, *args, **kwargs):
         """
         Register a timer for one hour and tell all rooms to boost
         """
@@ -243,21 +228,21 @@ class WiserHome(RestoreEntity):
             self._async_boost_end,
             datetime.timedelta(hours=1))
         for room in self.rooms:
-            await room.async_boost_all_mode(True)
+            await room.async_boost_all_mode_event(True)
 
-    async def _async_boost_end(self, **kwargs):
+    async def _async_boost_end(self, *args, **kwargs):
         """
         Method called when the boost is over
         """
         if self._boost_timer_remove is not None:
             self._boost_timer_remove()
         for room in self.rooms:
-            await room.async_boost_all_mode(False)
+            await room.async_boost_all_mode_event(False)
 
-    async def async_cancel_overrides(self, **kwargs):
+    async def async_cancel_overrides(self, *args, **kwargs):
         self._boost_all = False
         for room in self.rooms:
-            await room.async_auto_mode()
+            await room.async_auto_mode_event()
 
 
 
