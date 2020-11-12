@@ -186,7 +186,8 @@ async def test_setup_core_push_timezone(hass, aioclient_mock):
     assert aioclient_mock.call_count == 7
     assert aioclient_mock.mock_calls[2][2]["timezone"] == "testzone"
 
-    await hass.config.async_update(time_zone="America/New_York")
+    with patch("homeassistant.util.dt.set_default_time_zone"):
+        await hass.config.async_update(time_zone="America/New_York")
     await hass.async_block_till_done()
     assert aioclient_mock.mock_calls[-1][2]["timezone"] == "America/New_York"
 
@@ -213,7 +214,8 @@ async def test_fail_setup_without_environ_var(hass):
 async def test_warn_when_cannot_connect(hass, caplog):
     """Fail warn when we cannot connect."""
     with patch.dict(os.environ, MOCK_ENVIRON), patch(
-        "homeassistant.components.hassio.HassIO.is_connected", return_value=None,
+        "homeassistant.components.hassio.HassIO.is_connected",
+        return_value=None,
     ):
         result = await async_setup_component(hass, "hassio", {})
         assert result
